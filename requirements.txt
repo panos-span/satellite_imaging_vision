@@ -1,0 +1,6 @@
+albumentations
+rasperio
+sentinelsat
+geopandas
+shapely
+earthpy
