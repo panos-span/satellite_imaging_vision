@@ -1,0 +1,70 @@
+[
+    {
+      "name": "baseline_frozen",
+      "learning_rate": 1e-3,
+      "encoder_lr_factor": 0.0,
+      "optimizer": "adam",
+      "scheduler": "onecycle",
+      "freeze_backbone": true,
+      "progressive_unfreeze": false,
+      "weight_decay": 1e-4,
+      "description": "Baseline with frozen backbone (transfer learning)"
+    },
+    {
+      "name": "progressive_unfreeze",
+      "learning_rate": 1e-3,
+      "encoder_lr_factor": 0.1,
+      "optimizer": "adam",
+      "scheduler": "onecycle",
+      "freeze_backbone": true,
+      "progressive_unfreeze": true,
+      "weight_decay": 1e-4,
+      "description": "Progressive unfreezing starting from frozen backbone"
+    },
+    {
+      "name": "fine_tuning",
+      "learning_rate": 5e-4,
+      "encoder_lr_factor": 0.1,
+      "optimizer": "adam",
+      "scheduler": "onecycle",
+      "freeze_backbone": false,
+      "progressive_unfreeze": false,
+      "weight_decay": 1e-4,
+      "description": "Fine-tuning entire network with lower encoder LR"
+    },
+    {
+      "name": "sgd_momentum",
+      "learning_rate": 1e-2,
+      "encoder_lr_factor": 0.1,
+      "optimizer": "sgd",
+      "momentum": 0.9,
+      "scheduler": "onecycle",
+      "freeze_backbone": true,
+      "progressive_unfreeze": false,
+      "weight_decay": 1e-4,
+      "description": "SGD with momentum optimizer"
+    },
+    {
+      "name": "cosine_annealing",
+      "learning_rate": 1e-3,
+      "encoder_lr_factor": 0.1,
+      "optimizer": "adam",
+      "scheduler": "cosine",
+      "freeze_backbone": true,
+      "progressive_unfreeze": false,
+      "weight_decay": 1e-4,
+      "min_lr": 1e-6,
+      "description": "Cosine annealing scheduler with partial backbone training"
+    },
+    {
+      "name": "low_lr_fine_tuning",
+      "learning_rate": 1e-4,
+      "encoder_lr_factor": 0.05,
+      "optimizer": "adam",
+      "scheduler": "onecycle",
+      "freeze_backbone": false,
+      "progressive_unfreeze": false,
+      "weight_decay": 1e-4,
+      "description": "Fine-tuning with low learning rates"
+    }
+  ]
