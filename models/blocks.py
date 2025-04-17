@@ -1,8 +1,8 @@
 """
 Building blocks for constructing U-Net segmentation networks.
 
-This module provides common building blocks like convolutional blocks
-and upsampling blocks used in U-Net architecture.
+This module provides optimized building blocks for the U-Net architecture,
+including convolutional blocks and upsampling blocks with efficient skip connection handling.
 """
 
 import torch
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 class ConvBlock(nn.Module):
     """
-    Standard convolutional block with batch normalization and activation.
+    Convolutional block with normalization and activation.
 
     Parameters:
     -----------
@@ -21,56 +21,49 @@ class ConvBlock(nn.Module):
     out_channels : int
         Number of output channels
     kernel_size : int
-        Size of the convolutional kernel
+        Size of the convolution kernel
     padding : int
-        Padding size
+        Padding for the convolution
     use_batchnorm : bool
-        Whether to use batch normalization
-    activation : torch.nn.Module
-        Activation function to use
+        Whether to use batch normalization (True) or group normalization (False)
     """
 
     def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        padding=1,
-        use_batchnorm=True,
-        activation=nn.ReLU(inplace=True),
+        self, in_channels, out_channels, kernel_size=3, padding=1, use_batchnorm=True
     ):
         super().__init__()
 
-        # Define the convolutional layer
+        # Convolutional layer
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
             kernel_size=kernel_size,
             padding=padding,
-            bias=not use_batchnorm,  # No bias when using batch norm
+            bias=not use_batchnorm,  # No bias when using normalization
         )
 
-        # Define batch normalization layer if requested
-        self.bn = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
+        # Normalization layer
+        if use_batchnorm:
+            self.norm = nn.BatchNorm2d(out_channels)
+        else:
+            # Group normalization with optimal groups
+            num_groups = min(8, out_channels) if out_channels % 8 == 0 else 1
+            self.norm = nn.GroupNorm(num_groups, out_channels)
 
-        # Store activation function
-        self.activation = activation
+        # Activation function (using inplace for memory efficiency)
+        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        """Forward pass through the block."""
+        """Forward pass with efficient operations"""
         x = self.conv(x)
-        x = self.bn(x)
-        if self.activation:
-            x = self.activation(x)
+        x = self.norm(x)
+        x = self.activation(x)
         return x
 
 
 class DoubleConvBlock(nn.Module):
     """
-    Double convolutional block used in U-Net.
-
-    This block consists of two consecutive convolutional blocks with
-    batch normalization and activation.
+    Double convolutional block with shared activation.
 
     Parameters:
     -----------
@@ -98,10 +91,7 @@ class DoubleConvBlock(nn.Module):
 
 class UpBlock(nn.Module):
     """
-    Upsampling block used in U-Net decoder.
-
-    This block consists of an upsampling operation followed by a double
-    convolutional block. It also handles the skip connection concatenation.
+    Upsampling block for the decoder with efficient skip connection handling.
 
     Parameters:
     -----------
@@ -114,7 +104,7 @@ class UpBlock(nn.Module):
     use_batchnorm : bool
         Whether to use batch normalization
     bilinear : bool
-        Whether to use bilinear interpolation for upsampling
+        Whether to use bilinear upsampling or transposed convolution
     """
 
     def __init__(
@@ -127,62 +117,64 @@ class UpBlock(nn.Module):
     ):
         super().__init__()
 
-        # Define the upsampling operation
-        self.bilinear = bilinear
+        self.has_skip = skip_channels > 0
+
+        # Upsampling operation
         if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+            self.up = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+                nn.Conv2d(
+                    in_channels, in_channels // 2, kernel_size=1
+                ),  # Channel reduction
+            )
+            up_out_channels = in_channels // 2
         else:
             self.up = nn.ConvTranspose2d(
                 in_channels, in_channels // 2, kernel_size=2, stride=2
             )
+            up_out_channels = in_channels // 2
 
-        # Define the convolutional blocks
-        self.conv1 = ConvBlock(in_channels, out_channels, use_batchnorm=use_batchnorm)
-
-        # Combined channels accounting for skip connection
+        # Calculate combined channels after skip connection
         combined_channels = (
-            out_channels + skip_channels if skip_channels > 0 else out_channels
+            up_out_channels + skip_channels if self.has_skip else up_out_channels
         )
-        self.conv2 = ConvBlock(
+
+        # Double convolution after upsampling and potential concatenation
+        self.conv_block = DoubleConvBlock(
             combined_channels, out_channels, use_batchnorm=use_batchnorm
         )
 
     def forward(self, x, skip=None):
         """
-        Forward pass through the block.
+        Forward pass with efficient skip connection handling.
 
         Parameters:
         -----------
         x : torch.Tensor
-            Tensor from the encoder path
-        skip : torch.Tensor
-            Tensor from the skip connection
+            Input tensor from the previous decoder stage or encoder bottleneck
+        skip : torch.Tensor or None
+            Skip connection feature from the encoder
 
         Returns:
         --------
         torch.Tensor
-            Output tensor
+            Output tensor after upsampling and processing
         """
-        # Upsample x
+        # Upsampling
         x = self.up(x)
-        x = self.conv1(x)
 
-        # Skip connection
-        if skip is not None:
-            # Check if dimensions match
-            diffY = skip.size()[2] - x.size()[2]
-            diffX = skip.size()[3] - x.size()[3]
-
-            # Resize skip connection if dimensions don't match
-            if diffY != 0 or diffX != 0:
-                x = F.pad(
-                    x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2]
+        # Skip connection handling
+        if self.has_skip and skip is not None:
+            # Ensure spatial dimensions match
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(
+                    x, size=skip.shape[2:], mode="bilinear", align_corners=True
                 )
 
-            # Concatenate along the channel dimension
+            # Concatenate along channel dimension
             x = torch.cat([skip, x], dim=1)
 
-        # Apply second convolution
-        x = self.conv2(x)
+        # Apply convolution block
+        x = self.conv_block(x)
 
         return x
