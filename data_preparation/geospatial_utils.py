@@ -252,3 +252,41 @@ def create_multiband_stack(band_paths, output_path, band_names=None):
         dst.update_tags(band_names=','.join(sorted_band_names))
     
     return output_path, sorted_band_names
+
+
+def create_dummy_ground_truth(reference_path, output_path, fill_value=0):
+    """
+    Create a dummy ground truth mask based on a reference image.
+    
+    Parameters:
+    -----------
+    reference_path : str
+        Path to reference image
+    output_path : str
+        Path to save dummy ground truth
+    fill_value : int, optional
+        Value to fill the mask with
+    
+    Returns:
+    --------
+    output_path : str
+        Path to dummy ground truth
+    """
+    with rasterio.open(reference_path) as src:
+        profile = src.profile.copy()
+        profile.update({
+            'count': 1,
+            'dtype': rasterio.uint8
+        })
+        
+        # Create dummy mask filled with the fill value
+        dummy_mask = np.full((src.height, src.width), fill_value, dtype=np.uint8)
+        
+        # Write dummy mask
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            dst.write(dummy_mask, 1)
+            
+            # Add metadata
+            dst.update_tags(classes='background')
+    
+    return output_path

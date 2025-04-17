@@ -98,6 +98,7 @@ class SentinelPatchDataset(Dataset):
         if self.transform:
             # For albumentations, we need HWC format
             image_np = image.permute(1, 2, 0).numpy()
+
             mask_np = mask.numpy()
             
             transformed = self.transform(image=image_np, mask=mask_np)

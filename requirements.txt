@@ -4,3 +4,5 @@ sentinelsat
 geopandas
 shapely
 earthpy
+opencv-python
+torchgeo

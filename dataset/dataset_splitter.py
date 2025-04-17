@@ -1,13 +1,14 @@
 """
 Utilities for splitting datasets into training, validation, and testing subsets.
 """
+import json
 import os
+import shutil
+from pathlib import Path
+
 import numpy as np
 import rasterio
 from sklearn.model_selection import train_test_split
-import shutil
-import json
-from pathlib import Path
 
 
 def create_stratified_sample_indices(mask_path, validity_mask_path=None, 
