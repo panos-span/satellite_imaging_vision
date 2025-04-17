@@ -221,7 +221,7 @@ def train_epoch(model, dataloader, criterion, optimizer, metrics, device, num_cl
             
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast():
+                with autocast(device_type=device):
                     # Forward pass
                     outputs = model(images)
                     loss = criterion(outputs, masks)
@@ -298,7 +298,7 @@ def validate(model, dataloader, criterion, metrics, device, num_classes,
                 
                 # Mixed precision inference
                 if use_amp:
-                    with autocast():
+                    with autocast(device_type=device):
                         outputs = model(images)
                         loss = criterion(outputs, masks)
                 else:
