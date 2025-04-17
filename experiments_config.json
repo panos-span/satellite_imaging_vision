@@ -1,70 +1,114 @@
 [
-    {
-      "name": "baseline_frozen",
-      "learning_rate": 1e-3,
-      "encoder_lr_factor": 0.0,
-      "optimizer": "adam",
-      "scheduler": "onecycle",
-      "freeze_backbone": true,
-      "progressive_unfreeze": false,
-      "weight_decay": 1e-4,
-      "description": "Baseline with frozen backbone (transfer learning)"
-    },
-    {
-      "name": "progressive_unfreeze",
-      "learning_rate": 1e-3,
-      "encoder_lr_factor": 0.1,
-      "optimizer": "adam",
-      "scheduler": "onecycle",
-      "freeze_backbone": true,
-      "progressive_unfreeze": true,
-      "weight_decay": 1e-4,
-      "description": "Progressive unfreezing starting from frozen backbone"
-    },
-    {
-      "name": "fine_tuning",
-      "learning_rate": 5e-4,
-      "encoder_lr_factor": 0.1,
-      "optimizer": "adam",
-      "scheduler": "onecycle",
-      "freeze_backbone": false,
-      "progressive_unfreeze": false,
-      "weight_decay": 1e-4,
-      "description": "Fine-tuning entire network with lower encoder LR"
-    },
-    {
-      "name": "sgd_momentum",
-      "learning_rate": 1e-2,
-      "encoder_lr_factor": 0.1,
-      "optimizer": "sgd",
-      "momentum": 0.9,
-      "scheduler": "onecycle",
-      "freeze_backbone": true,
-      "progressive_unfreeze": false,
-      "weight_decay": 1e-4,
-      "description": "SGD with momentum optimizer"
-    },
-    {
-      "name": "cosine_annealing",
-      "learning_rate": 1e-3,
-      "encoder_lr_factor": 0.1,
-      "optimizer": "adam",
-      "scheduler": "cosine",
-      "freeze_backbone": true,
-      "progressive_unfreeze": false,
-      "weight_decay": 1e-4,
-      "min_lr": 1e-6,
-      "description": "Cosine annealing scheduler with partial backbone training"
-    },
-    {
-      "name": "low_lr_fine_tuning",
-      "learning_rate": 1e-4,
-      "encoder_lr_factor": 0.05,
-      "optimizer": "adam",
-      "scheduler": "onecycle",
-      "freeze_backbone": false,
-      "progressive_unfreeze": false,
-      "weight_decay": 1e-4,
-      "description": "Fine-tuning with low learning rates"
-    }
-  ]
+  {
+    "name": "frozen_backbone_onecycle",
+    "learning_rate": 5e-4,
+    "encoder_lr_factor": 0.0,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "Frozen backbone with OneCycle learning rate scheduler",
+    "use_normalizer": true
+  },
+  {
+    "name": "progressive_unfreeze",
+    "learning_rate": 1e-3,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": true,
+    "weight_decay": 1e-4,
+    "description": "Progressive unfreezing starting from frozen backbone",
+    "use_normalizer": true
+  },
+  {
+    "name": "fine_tuning",
+    "learning_rate": 1e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": false,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "Fine-tuning entire network with lower encoder LR",
+    "use_normalizer": true
+  },
+  {
+    "name": "sgd_momentum",
+    "learning_rate": 5e-3,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "sgd",
+    "momentum": 0.9,
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "SGD with momentum optimizer",
+    "use_normalizer": true
+  },
+  {
+    "name": "cosine_annealing",
+    "learning_rate": 2e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "cosine",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "min_lr": 1e-6,
+    "description": "Cosine annealing scheduler with partial backbone training",
+    "use_normalizer": true
+  },
+  {
+    "name": "high_lr_frozen",
+    "learning_rate": 1e-3,
+    "encoder_lr_factor": 0.0,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "Completely frozen backbone with higher learning rate",
+    "use_normalizer": true
+  },
+  {
+    "name": "plateau_scheduler",
+    "learning_rate": 3e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "plateau",
+    "factor": 0.5,
+    "patience": 3,
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "ReduceLROnPlateau scheduler for adaptive learning rates",
+    "use_normalizer": true
+  },
+  {
+    "name": "low_weight_decay",
+    "learning_rate": 5e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-5,
+    "description": "Lower weight decay for less regularization",
+    "use_normalizer": true
+  },
+  {
+    "name": "higher_encoder_lr",
+    "learning_rate": 5e-4,
+    "encoder_lr_factor": 0.3,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "description": "Higher learning rate for encoder relative to decoder",
+    "use_normalizer": true
+  }
+]
