@@ -90,7 +90,13 @@ if __name__ == "__main__":
         default=True,
         help="Auto-detect number of classes from dataset",
     )
-
+    parser.add_argument(
+        "--use_normalizer", 
+        action="store_true", 
+        default=True,  # Default to True for experiments
+        help="Use the saved Sentinel-2 normalizer from dataset directory"
+    )
+    
     # Training parameters
     parser.add_argument(
         "--batch_size", type=int, default=8, help="Batch size for training"
@@ -315,6 +321,7 @@ if __name__ == "__main__":
                 "transfer_learning_mode": args.transfer_learning_mode,
                 "use_amp": args.use_amp,
                 "total_experiments": len(experiment_configs),
+                "normalizer": "Sentinel2Normalizer" if args.use_normalizer else "None",
             },
             job_type="sweep-control",
         )

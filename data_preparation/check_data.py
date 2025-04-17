@@ -11,7 +11,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.ops import unary_union
 
-from improved_cloud_coverage import check_cloud_coverage_improved
+from cloud_coverage import check_cloud_coverage_improved
 
 def extract_sentinel_zip(zip_path, extract_dir=None):
     """

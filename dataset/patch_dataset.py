@@ -7,8 +7,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import glob
 import json
-from pathlib import Path
-
 
 class SentinelPatchDataset(Dataset):
     """

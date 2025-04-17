@@ -27,6 +27,7 @@ from dataset.class_remapper import create_class_remapper
 from dataset.mask_handler import clean_mask, inspect_dataset_masks
 from dataset.metrics import create_metrics
 from dataset.patch_dataset import create_patch_data_loaders
+from dataset.normalizers import load_sentinel2_normalizer, normalize_batch
 from dataset.utils import detect_classes_from_dataset
 from models.unet import UNet
 
@@ -181,231 +182,142 @@ def progressive_unfreeze_backbone(model, current_epoch, unfreeze_schedule=None):
                 )
 
 
-"""
-Updated train_epoch function with loss stabilization and debugging.
-Replace the train_epoch function in your train.py with this improved version.
-"""
 
-
-def train_epoch(
-    model,
-    dataloader,
-    criterion,
-    optimizer,
-    metrics,
-    device,
-    num_classes,
-    scaler=None,
-    use_amp=False,
-    remapper=None,
-):
-    """Train for one epoch with loss stabilization and debugging."""
+def train_epoch(model, dataloader, criterion, optimizer, metrics, device, num_classes, 
+                scaler=None, use_amp=False, remapper=None, normalizer=None):
+    """Train for one epoch with mixed precision support and normalization."""
     model.train()
     epoch_loss = 0
     batch_count = 0
-
+    
     # Reset metrics at the start of epoch
     metrics.reset()
-
+    
     with tqdm(dataloader, desc="Training") as pbar:
         for images, masks in pbar:
             batch_count += 1
             images = images.to(device)
             
-            images = normalize_sentinel2_data(images)
-
+            # Apply normalization - this is the key addition
+            if normalizer is not None:
+                images = normalize_batch(images, normalizer, device)
+            else:
+                # Simple check for high-value Sentinel-2 data
+                if images.max() > 100:
+                    # Apply default normalization for Sentinel-2
+                    print(f"Applying default Sentinel-2 normalization (max value: {images.max().item():.1f})")
+                    images = images / 10000.0
+            
             # Apply class remapping if provided
             if remapper is not None:
                 masks = remapper.remap_mask(masks)
-
+            
             # Clean mask to ensure valid class indices
             masks = clean_mask(masks, num_classes=num_classes, ignore_index=-100)
             masks = masks.long().to(device)
-
-            # Debug: Check masks for invalid values
-            if torch.isnan(masks).any() or torch.isinf(masks).any():
-                print(f"WARNING: NaN or Inf values found in masks, batch {batch_count}")
-                print(f"Mask range: [{masks.min().item()}, {masks.max().item()}]")
-                print(f"Mask unique values: {torch.unique(masks).cpu().numpy()}")
-                # Skip this batch if there are issues
-                continue
-
+            
             # Zero gradients
             optimizer.zero_grad()
-
+            
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast(device_type="cuda"):
+                with autocast():
                     # Forward pass
                     outputs = model(images)
-
-                    # Debug: Check outputs for extreme values
-                    if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                        print(
-                            f"WARNING: NaN or Inf values found in model outputs, batch {batch_count}"
-                        )
-                        # Skip this batch if there are issues
-                        continue
-
-                    # Add a small epsilon to prevent log(0) in softmax-based losses
-                    if num_classes > 1:  # Multiclass segmentation
-                        # Apply loss stabilization
-                        outputs = torch.clamp(outputs, min=-50.0, max=50.0)
-
-                    # Compute loss
-                    try:
-                        loss = criterion(outputs, masks)
-
-                        # Check if loss is NaN or Inf
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            print(
-                                f"WARNING: NaN or Inf loss detected in batch {batch_count}"
-                            )
-                            print(
-                                f"Loss value: {loss.item() if not torch.isnan(loss) else 'NaN'}"
-                            )
-                            # Skip this batch
-                            continue
-
-                    except Exception as e:
-                        print(f"Error computing loss: {e}")
-                        continue
-
+                    loss = criterion(outputs, masks)
+                
                 # Backward pass with gradient scaling
-                try:
-                    scaler.scale(loss).backward()
-
-                    # Clip gradients to prevent explosion
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                    scaler.step(optimizer)
-                    scaler.update()
-                except Exception as e:
-                    print(f"Error in backward pass: {e}")
-                    continue
+                scaler.scale(loss).backward()
+                
+                # Clip gradients to prevent explosion
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 # Standard precision training
                 outputs = model(images)
-
-                # Debug: Check outputs for extreme values
-                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                    print(
-                        f"WARNING: NaN or Inf values found in model outputs, batch {batch_count}"
-                    )
-                    # Skip this batch if there are issues
-                    continue
-
-                # Add a small epsilon to prevent log(0) in softmax-based losses
-                if num_classes > 1:  # Multiclass segmentation
-                    # Apply loss stabilization
-                    outputs = torch.clamp(outputs, min=-50.0, max=50.0)
-
-                # Compute loss
-                try:
-                    loss = criterion(outputs, masks)
-
-                    # Check if loss is NaN or Inf
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(
-                            f"WARNING: NaN or Inf loss detected in batch {batch_count}"
-                        )
-                        print(
-                            f"Loss value: {loss.item() if not torch.isnan(loss) else 'NaN'}"
-                        )
-                        # Skip this batch
-                        continue
-
-                except Exception as e:
-                    print(f"Error computing loss: {e}")
-                    continue
-
-                # Backward pass
-                try:
-                    loss.backward()
-
-                    # Clip gradients to prevent explosion
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                    optimizer.step()
-                except Exception as e:
-                    print(f"Error in backward pass: {e}")
-                    continue
-
+                loss = criterion(outputs, masks)
+                loss.backward()
+                
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+            
             # Update metrics
-            with torch.no_grad():
-                metrics.update(outputs, masks)
-
+            metrics.update(outputs, masks)
+            
             # Update loss statistics
             epoch_loss += loss.item()
-
+            
             # Update progress bar
             pbar.set_postfix(loss=loss.item())
-
+            
             # Log batch metrics to wandb (optional)
             if batch_count % 10 == 0 and wandb.run is not None:
                 wandb.log({"batch/train_loss": loss.item()})
-
+    
     # Compute average metrics
     metric_values = metrics.compute()
-    epoch_loss /= max(1, len(dataloader))  # Prevent division by zero
-
+    epoch_loss /= len(dataloader)
+    
     return epoch_loss, metric_values
 
 
-def validate(
-    model,
-    dataloader,
-    criterion,
-    metrics,
-    device,
-    num_classes,
-    use_amp=False,
-    remapper=None,
-):
-    """Validate the model with mixed precision support."""
+def validate(model, dataloader, criterion, metrics, device, num_classes, 
+             use_amp=False, remapper=None, normalizer=None):
+    """Validate the model with mixed precision support and normalization."""
     model.eval()
     val_loss = 0
-
+    
     # Reset metrics at the start of validation
     metrics.reset()
-
+    
     with torch.no_grad():
         with tqdm(dataloader, desc="Validation") as pbar:
             for images, masks in pbar:
                 images = images.to(device)
                 
-                images = normalize_sentinel2_data(images)
-
+                # Apply normalization - this is the key addition
+                if normalizer is not None:
+                    images = normalize_batch(images, normalizer, device)
+                else:
+                    # Simple check for high-value Sentinel-2 data
+                    if images.max() > 100:
+                        images = images / 10000.0
+                
                 # Apply class remapping if provided
                 if remapper is not None:
                     masks = remapper.remap_mask(masks)
-
+                
                 # Clean mask to ensure valid class indices
                 masks = clean_mask(masks, num_classes=num_classes, ignore_index=-100)
                 masks = masks.long().to(device)
-
+                
                 # Mixed precision inference
                 if use_amp:
-                    with autocast(device_type="cuda"):
+                    with autocast():
                         outputs = model(images)
                         loss = criterion(outputs, masks)
                 else:
                     outputs = model(images)
                     loss = criterion(outputs, masks)
-
+                
                 # Update metrics
                 metrics.update(outputs, masks)
-
+                
                 # Update loss statistics
                 val_loss += loss.item()
-
+                
                 # Update progress bar
                 pbar.set_postfix(loss=loss.item())
-
+    
     # Compute average metrics
     metric_values = metrics.compute()
     val_loss /= len(dataloader)
-
+    
     return val_loss, metric_values
 
 
@@ -486,6 +398,7 @@ def train_model(
     remapper=None,
     use_amp=True,
     unfreeze_schedule=None,
+    normalizer=None,
 ):
     """Train the model with monitoring, validation, and optimization features."""
     # Create save directory if it doesn't exist
@@ -559,6 +472,7 @@ def train_model(
             scaler,
             use_amp,
             remapper,
+            normalizer
         )
 
         # Validate
@@ -571,6 +485,7 @@ def train_model(
             num_classes,
             use_amp,
             remapper,
+            normalizer
         )
 
         # Get current learning rates
@@ -696,13 +611,13 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
     # Create experiment directory
     experiment_dir = os.path.join(args.save_dir, "experiments")
     os.makedirs(experiment_dir, exist_ok=True)
-
+    
     # Get data loaders
     train_transform = get_train_transform(
         p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
-
+    
     data_loaders = create_patch_data_loaders(
         patches_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -710,7 +625,23 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
         val_transform=val_transform,
         num_workers=args.num_workers,
     )
-
+    
+    # Load normalizer if requested and available
+    normalizer = None
+    if getattr(args, "use_normalizer", True):  # Default to True if not specified
+        normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
+        if os.path.exists(normalizer_path):
+            print(f"Loading Sentinel-2 normalizer from {normalizer_path}")
+            try:
+                normalizer = load_sentinel2_normalizer(normalizer_path)
+                print(f"Loaded normalizer with method: {normalizer.method}")
+            except Exception as e:
+                print(f"Error loading normalizer: {e}")
+                print("Will apply default normalization during training")
+        else:
+            print(f"Warning: Normalizer not found at {normalizer_path}")
+            print("Will apply default normalization during training")
+            
     # Auto-detect classes if not specified
     class_remapper = None
     if args.auto_detect_classes or args.num_classes is None:
@@ -943,6 +874,10 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
 
     # Log summary table to wandb if it's being used
     if wandb_project and wandb.run is not None:
+        wandb.config.update({
+            "using_normalizer": normalizer is not None,
+            "normalizer_type": getattr(normalizer, "method", "default") if normalizer else "none"
+        })
         # Create a table to log all results
         columns = [
             "config_name",
@@ -1006,6 +941,17 @@ def main(args):
         p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
+    
+    normalizer = None
+    if args.use_normalizer:
+        normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
+        if os.path.exists(normalizer_path):
+            print(f"Loading Sentinel-2 normalizer from {normalizer_path}")
+            normalizer = load_sentinel2_normalizer(normalizer_path)
+            print(f"Loaded normalizer with method: {normalizer.method}")
+        else:
+            print(f"Warning: Normalizer not found at {normalizer_path}")
+            print("Will apply default normalization during training")
 
     data_loaders = create_patch_data_loaders(
         patches_dir=args.data_dir,
@@ -1211,6 +1157,7 @@ def main(args):
         remapper=class_remapper,
         use_amp=getattr(args, "use_amp", True),
         unfreeze_schedule=unfreeze_schedule,
+        normalizer=normalizer
     )
 
     # Plot learning curves
@@ -1304,6 +1251,12 @@ if __name__ == "__main__":
         action="store_true",
         default=True,
         help="Use automatic mixed precision",
+    )
+    parser.add_argument(
+        "--use_normalizer", 
+        action="store_true",  
+        default=True,
+        help="Use the saved Sentinel-2 normalizer from dataset directory"
     )
 
     # Scheduler parameters
