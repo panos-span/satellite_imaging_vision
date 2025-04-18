@@ -98,7 +98,7 @@ def parse_args():
     parser.add_argument(
         "--force_include_zero",
         action="store_true",
-        default=False,
+        default=True,
         help="Force inclusion of class 0 (background) in the class mapping",
     )
     parser.add_argument(
