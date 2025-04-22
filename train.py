@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
+import argparse
 
 import wandb
 from dataset.augmentation import get_train_transform, get_val_transform
@@ -36,46 +37,15 @@ from models.unet import UNet
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#python train.py --data_dir "F:\\output\remapped_dataset" 
-#    --save_dir "F:\\output\model_results\stable" 
-#    --model_name unet_sentinel2_stable 
-#    --encoder_type best_performance 
-#    --freeze_backbone 
-#    --encoder_lr_factor 0.1 
-#    --learning_rate 5e-4 
-#    --scheduler onecycle 
+# python train.py --data_dir "F:\\output\remapped_dataset"
+#    --save_dir "F:\\output\model_results\stable"
+#    --model_name unet_sentinel2_stable
+#    --encoder_type best_performance
+#    --freeze_backbone
+#    --encoder_lr_factor 0.1
+#    --learning_rate 5e-4
+#    --scheduler onecycle
 #    --use_amp
-
-
-def normalize_sentinel2_data(data, max_value=10000.0):
-    """
-    Normalize Sentinel-2 data to the range [0,1].
-    
-    Parameters:
-    -----------
-    data : torch.Tensor
-        Input data tensor of shape (B, C, H, W)
-    max_value : float
-        Value to divide by (default 10000.0 for standard Sentinel-2 reflectance)
-        
-    Returns:
-    --------
-    torch.Tensor
-        Normalized data tensor
-    """
-    # Check if normalization is needed
-    if data.max() > 100:  # Heuristic to detect unnormalized data
-        #print(f"Normalizing Sentinel-2 data from range [{data.min().item():.2f}, {data.max().item():.2f}]")
-        
-        # Handle very large values and NaN/Inf values
-        data = torch.clamp(data, min=0.0, max=max_value * 3.0)  # Clip extreme outliers
-        
-        # Perform normalization to [0,1]
-        data = data / max_value
-        
-        #print(f"After normalization: range [{data.min().item():.4f}, {data.max().item():.4f}]")
-    
-    return data
 
 
 def create_optimizer_with_differential_lr(
@@ -182,57 +152,61 @@ def progressive_unfreeze_backbone(model, current_epoch, unfreeze_schedule=None):
                 )
 
 
-
-def train_epoch(model, dataloader, criterion, optimizer, metrics, device, num_classes, 
-                scaler=None, use_amp=False, remapper=None, normalizer=None):
+def train_epoch(
+    model,
+    dataloader,
+    criterion,
+    optimizer,
+    metrics,
+    device,
+    num_classes,
+    scaler=None,
+    use_amp=False,
+    remapper=None,
+    normalizer=None,
+):
     """Train for one epoch with mixed precision support and normalization."""
     model.train()
     epoch_loss = 0
     batch_count = 0
-    
+
     # Reset metrics at the start of epoch
     metrics.reset()
-    
+
     with tqdm(dataloader, desc="Training") as pbar:
         for images, masks in pbar:
             batch_count += 1
             images = images.to(device)
-            
+
             # Apply normalization - this is the key addition
             if normalizer is not None:
                 images = normalize_batch(images, normalizer, device)
-            else:
-                # Simple check for high-value Sentinel-2 data
-                if images.max() > 100:
-                    # Apply default normalization for Sentinel-2
-                    print(f"Applying default Sentinel-2 normalization (max value: {images.max().item():.1f})")
-                    images = images / 10000.0
-            
+
             # Apply class remapping if provided
             if remapper is not None:
                 masks = remapper.remap_mask(masks)
-            
+
             # Clean mask to ensure valid class indices
             masks = clean_mask(masks, num_classes=num_classes, ignore_index=-100)
             masks = masks.long().to(device)
-            
+
             # Zero gradients
             optimizer.zero_grad()
-            
+
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast(device_type=device):
+                with autocast(device_type='cuda'):
                     # Forward pass
                     outputs = model(images)
                     loss = criterion(outputs, masks)
-                
+
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
-                
+
                 # Clip gradients to prevent explosion
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
+
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -240,46 +214,55 @@ def train_epoch(model, dataloader, criterion, optimizer, metrics, device, num_cl
                 outputs = model(images)
                 loss = criterion(outputs, masks)
                 loss.backward()
-                
+
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
+
                 optimizer.step()
-            
+
             # Update metrics
             metrics.update(outputs, masks)
-            
+
             # Update loss statistics
             epoch_loss += loss.item()
-            
+
             # Update progress bar
             pbar.set_postfix(loss=loss.item())
-            
+
             # Log batch metrics to wandb (optional)
             if batch_count % 10 == 0 and wandb.run is not None:
                 wandb.log({"batch/train_loss": loss.item()})
-    
+
     # Compute average metrics
     metric_values = metrics.compute()
     epoch_loss /= len(dataloader)
-    
+
     return epoch_loss, metric_values
 
 
-def validate(model, dataloader, criterion, metrics, device, num_classes, 
-             use_amp=False, remapper=None, normalizer=None):
+def validate(
+    model,
+    dataloader,
+    criterion,
+    metrics,
+    device,
+    num_classes,
+    use_amp=False,
+    remapper=None,
+    normalizer=None,
+):
     """Validate the model with mixed precision support and normalization."""
     model.eval()
     val_loss = 0
-    
+
     # Reset metrics at the start of validation
     metrics.reset()
-    
+
     with torch.no_grad():
         with tqdm(dataloader, desc="Validation") as pbar:
             for images, masks in pbar:
                 images = images.to(device)
-                
+
                 # Apply normalization - this is the key addition
                 if normalizer is not None:
                     images = normalize_batch(images, normalizer, device)
@@ -287,37 +270,37 @@ def validate(model, dataloader, criterion, metrics, device, num_classes,
                     # Simple check for high-value Sentinel-2 data
                     if images.max() > 100:
                         images = images / 10000.0
-                
+
                 # Apply class remapping if provided
                 if remapper is not None:
                     masks = remapper.remap_mask(masks)
-                
+
                 # Clean mask to ensure valid class indices
                 masks = clean_mask(masks, num_classes=num_classes, ignore_index=-100)
                 masks = masks.long().to(device)
-                
+
                 # Mixed precision inference
                 if use_amp:
-                    with autocast(device_type=device):
+                    with autocast(device_type='cuda'):
                         outputs = model(images)
                         loss = criterion(outputs, masks)
                 else:
                     outputs = model(images)
                     loss = criterion(outputs, masks)
-                
+
                 # Update metrics
                 metrics.update(outputs, masks)
-                
+
                 # Update loss statistics
                 val_loss += loss.item()
-                
+
                 # Update progress bar
                 pbar.set_postfix(loss=loss.item())
-    
+
     # Compute average metrics
     metric_values = metrics.compute()
     val_loss /= len(dataloader)
-    
+
     return val_loss, metric_values
 
 
@@ -472,7 +455,7 @@ def train_model(
             scaler,
             use_amp,
             remapper,
-            normalizer
+            normalizer,
         )
 
         # Validate
@@ -485,7 +468,7 @@ def train_model(
             num_classes,
             use_amp,
             remapper,
-            normalizer
+            normalizer,
         )
 
         # Get current learning rates
@@ -611,22 +594,14 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
     # Create experiment directory
     experiment_dir = os.path.join(args.save_dir, "experiments")
     os.makedirs(experiment_dir, exist_ok=True)
-    
+
     # Get data loaders
     train_transform = get_train_transform(
         p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
-    
-    data_loaders = create_patch_data_loaders(
-        patches_dir=args.data_dir,
-        batch_size=args.batch_size,
-        train_transform=train_transform,
-        val_transform=val_transform,
-        num_workers=args.num_workers,
-    )
-    
-    # Load normalizer if requested and available
+
+    # Load normalizer if requested and available - IMPORTANT FIX
     normalizer = None
     if getattr(args, "use_normalizer", True):  # Default to True if not specified
         normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
@@ -641,15 +616,54 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
         else:
             print(f"Warning: Normalizer not found at {normalizer_path}")
             print("Will apply default normalization during training")
-            
-    # Auto-detect classes if not specified
+
+    data_loaders = create_patch_data_loaders(
+        patches_dir=args.data_dir,
+        batch_size=args.batch_size,
+        train_transform=train_transform,
+        val_transform=val_transform,
+        num_workers=args.num_workers,
+    )
+
+    # Inspect dataset masks to detect issues - ADDED FROM MAIN
+    print("\nInspecting dataset for mask issues...")
+    train_inspection = inspect_dataset_masks(
+        data_loaders["train"].dataset, num_samples=50
+    )
+
+    # Initialize class remapper if sparse indices detected - ADDED FROM MAIN
     class_remapper = None
-    if args.auto_detect_classes or args.num_classes is None:
+    if train_inspection.get("sparse_indices", False):
+        print("\nDetected sparse class indices. Creating class remapper...")
+        class_remapper = create_class_remapper(
+            data_loaders["train"].dataset, num_samples=100
+        )
+
+        # Update number of classes based on remapped classes
+        args.num_classes = class_remapper.num_classes
+        print(f"Using {args.num_classes} classes after remapping")
+    # Auto-detect classes if not specified
+    elif args.auto_detect_classes or args.num_classes is None:
         print("Auto-detecting classes from dataset...")
         class_info = detect_classes_from_dataset(
             data_loaders["train"].dataset, sample_size=100
         )
-        args.num_classes = class_info["num_classes"]
+        detected_num_classes = class_info["num_classes"]
+
+        # Check if auto-detected classes match with inspection results
+        if "recommended_num_classes" in train_inspection:
+            recommended = train_inspection["recommended_num_classes"]
+            if recommended > detected_num_classes:
+                print(
+                    f"WARNING: Inspection suggests {recommended} classes but auto-detection found {detected_num_classes}"
+                )
+                print(f"Using the larger value ({recommended}) to be safe")
+                args.num_classes = recommended
+            else:
+                args.num_classes = detected_num_classes
+        else:
+            args.num_classes = detected_num_classes
+
         print(f"Auto-detected {args.num_classes} classes")
 
     # Define default hyperparameter configurations if not provided
@@ -805,7 +819,7 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             "experiment": config["name"],
         }
 
-        # Train model
+        # Train model - IMPORTANT FIX: ADDED NORMALIZER
         print(f"Training with config: {config}")
         history, best_epoch = train_model(
             model,
@@ -825,6 +839,7 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             remapper=class_remapper,
             use_amp=getattr(args, "use_amp", True),
             unfreeze_schedule=unfreeze_schedule,
+            normalizer=normalizer,  # This is the key fix
         )
 
         # Plot learning curves
@@ -874,10 +889,14 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
 
     # Log summary table to wandb if it's being used
     if wandb_project and wandb.run is not None:
-        wandb.config.update({
-            "using_normalizer": normalizer is not None,
-            "normalizer_type": getattr(normalizer, "method", "default") if normalizer else "none"
-        })
+        wandb.config.update(
+            {
+                "using_normalizer": normalizer is not None,
+                "normalizer_type": (
+                    getattr(normalizer, "method", "default") if normalizer else "none"
+                ),
+            }
+        )
         # Create a table to log all results
         columns = [
             "config_name",
@@ -941,7 +960,7 @@ def main(args):
         p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
-    
+
     normalizer = None
     if args.use_normalizer:
         normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
@@ -1157,7 +1176,7 @@ def main(args):
         remapper=class_remapper,
         use_amp=getattr(args, "use_amp", True),
         unfreeze_schedule=unfreeze_schedule,
-        normalizer=normalizer
+        normalizer=normalizer,
     )
 
     # Plot learning curves
@@ -1178,8 +1197,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Train Sentinel-2 segmentation model with TorchGeo integration"
     )
@@ -1222,7 +1239,7 @@ if __name__ == "__main__":
 
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--num_epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument(
         "--learning_rate", type=float, default=1e-3, help="Learning rate"
     )
@@ -1253,10 +1270,10 @@ if __name__ == "__main__":
         help="Use automatic mixed precision",
     )
     parser.add_argument(
-        "--use_normalizer", 
-        action="store_true",  
+        "--use_normalizer",
+        action="store_true",
         default=True,
-        help="Use the saved Sentinel-2 normalizer from dataset directory"
+        help="Use the saved Sentinel-2 normalizer from dataset directory",
     )
 
     # Scheduler parameters

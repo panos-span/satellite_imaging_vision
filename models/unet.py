@@ -356,6 +356,12 @@ class UNet(nn.Module):
         freeze_backbone=True,
     ):
         super().__init__()
+        
+        for name, param in self.named_parameters():
+            if 'weight' in name and 'bn' not in name:
+                torch.nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+            elif 'bias' in name:
+                torch.nn.init.constant_(param, 0)
 
         self.in_channels = in_channels
         self.num_classes = num_classes
@@ -412,7 +418,7 @@ class UNet(nn.Module):
     def forward(self, x):
         """
         Forward pass through the U-Net.
-#
+
         Parameters:
         -----------
         x : torch.Tensor

@@ -10,7 +10,84 @@ import torch
 import rasterio
 from sklearn.preprocessing import MinMaxScaler as SklearnMinMaxScaler
 from sklearn.preprocessing import StandardScaler as SklearnStandardScaler
+import random
 
+def get_sentinel2_statistics(image_path, bands=None, sample_size=1000):
+    """
+    Calculate statistics for Sentinel-2 bands from an image.
+
+    Parameters:
+    -----------
+    image_path : str
+        Path to Sentinel-2 GeoTIFF
+    bands : list, optional
+        List of band indices to calculate statistics for. If None, all bands.
+    sample_size : int, optional
+        Number of random samples to use for calculation
+
+    Returns:
+    --------
+    stats : dict
+        Dictionary with mean, std, min, and max values for each band
+    """
+
+    try:
+        with rasterio.open(image_path) as src:
+            height, width = src.height, src.width
+            num_bands = src.count
+
+            if bands is None:
+                bands = list(range(1, num_bands + 1))  # 1-based indexing
+
+            # Generate random pixel locations
+            random.seed(42)  # For reproducibility
+            sample_pixels = [
+                (random.randint(0, height - 1), random.randint(0, width - 1))
+                for _ in range(sample_size)
+            ]
+
+            stats = {"mean": [], "std": [], "min": [], "max": []}
+
+            # Read values for each band
+            for band_idx in bands:
+                band_data = src.read(band_idx)
+
+                # Collect sample values
+                sample_values = [
+                    band_data[y, x]
+                    for y, x in sample_pixels
+                    if 0 <= y < height and 0 <= x < width
+                ]
+
+                # Calculate statistics
+                sample_values = np.array(sample_values)
+                sample_values = sample_values[~np.isnan(sample_values)]  # Remove NaN values
+
+                if len(sample_values) > 0:
+                    mean_val = sample_values.mean()
+                    std_val = sample_values.std()
+                    min_val = sample_values.min()
+                    max_val = sample_values.max()
+                else:
+                    mean_val = 0
+                    std_val = 1
+                    min_val = 0
+                    max_val = 1
+
+                stats["mean"].append(mean_val)
+                stats["std"].append(std_val)
+                stats["min"].append(min_val)
+                stats["max"].append(max_val)
+
+                print(
+                    f"Band {band_idx}: Mean={mean_val:.2f}, Std={std_val:.2f}, Min={min_val:.2f}, Max={max_val:.2f}"
+                )
+
+        return stats
+    
+    except Exception as e:
+        print(f"Error calculating statistics: {e}")
+        return {"mean": [], "std": [], "min": [], "max": []}
 
 class MinMaxScaler:
     """
@@ -403,7 +480,7 @@ class Sentinel2Normalizer:
         """
         is_tensor = isinstance(image, torch.Tensor)
         if is_tensor:
-            image_np = image.numpy()
+            image_np = image.cpu().numpy()
         else:
             image_np = image.copy()  # Create a copy to avoid modifying the original
 
@@ -411,8 +488,8 @@ class Sentinel2Normalizer:
         if image_np.max() > 100:
             # Apply scaling factor for TorchGeo models
             image_np = image_np / self.raw_scale_factor
-            if self.torchgeo_specific:
-                print(f"Applied scaling factor: {self.raw_scale_factor}")
+            #if self.torchgeo_specific:
+            #    print(f"Applied scaling factor: {self.raw_scale_factor}")
 
         # Create normalized output
         normalized = np.zeros_like(image_np, dtype=np.float32)
@@ -490,17 +567,7 @@ class Sentinel2Normalizer:
 # Function to load a saved normalizer
 def load_sentinel2_normalizer(normalizer_path):
     """
-    Load a previously saved Sentinel2Normalizer.
-
-    Parameters:
-    -----------
-    normalizer_path : str
-        Path to the saved normalizer pickle file
-
-    Returns:
-    --------
-    Sentinel2Normalizer
-        Loaded normalizer object
+    Load a previously saved Sentinel2Normalizer with improved error handling.
     """
     import pickle
 
@@ -515,18 +582,36 @@ def load_sentinel2_normalizer(normalizer_path):
         # Ensure is_fitted attribute exists
         if not hasattr(normalizer, "is_fitted"):
             normalizer.is_fitted = True
+            
+        # Ensure method is set
+        if not hasattr(normalizer, "method"):
+            normalizer.method = "pretrained"
+            
+        # Ensure RGB stats are properly set
+        if not hasattr(normalizer, "rgb_mean") or not hasattr(normalizer, "rgb_std"):
+            normalizer.rgb_mean = [0.485, 0.456, 0.406]
+            normalizer.rgb_std = [0.229, 0.224, 0.225]
+            
+        # Ensure other band stats are properly set
+        if not hasattr(normalizer, "other_mean") or not hasattr(normalizer, "other_std"):
+            normalizer.other_mean = 0.5
+            normalizer.other_std = 0.5
+            
+        # Ensure raw_scale_factor is set
+        if not hasattr(normalizer, "raw_scale_factor"):
+            normalizer.raw_scale_factor = 10000.0
 
+        print(f"Successfully loaded normalizer with method: {normalizer.method}")
         return normalizer
     except Exception as e:
         print(f"Error loading normalizer: {e}")
-        print("Creating a default normalizer...")
+        print("Creating a default normalizer for Sentinel-2 data...")
         return Sentinel2Normalizer(method="pretrained")
-
 
 # Function to normalize a batch of images
 def normalize_batch(batch, normalizer=None, device=None):
     """
-    Normalize a batch of images using the provided normalizer.
+    Normalize a batch of images using the provided normalizer with improved error handling.
 
     Parameters:
     -----------
@@ -542,6 +627,11 @@ def normalize_batch(batch, normalizer=None, device=None):
     torch.Tensor
         Normalized batch
     """
+    # Error checking - make sure we don't have NaNs or Infs in the input
+    if torch.isnan(batch).any() or torch.isinf(batch).any():
+        print("WARNING: Input batch contains NaN or Inf values. Applying clipping.")
+        batch = torch.nan_to_num(batch, nan=0.0, posinf=10000.0, neginf=0.0)
+    
     # Handle None normalizer case
     if normalizer is None:
         # Simple min-max normalization to [0,1]
@@ -553,21 +643,48 @@ def normalize_batch(batch, normalizer=None, device=None):
             # Divide by typical Sentinel-2 scale
             normalized = batch / 10000.0
         elif batch_max > batch_min:
-            # Standard min-max normalization
-            normalized = (batch - batch_min) / (batch_max - batch_min)
+            # Standard min-max normalization with epsilon for stability
+            epsilon = 1e-8
+            normalized = (batch - batch_min) / max((batch_max - batch_min), epsilon)
         else:
             # Handle constant values
             normalized = torch.zeros_like(batch)
     else:
-        # Use the provided normalizer
-        if isinstance(batch, torch.Tensor):
-            # Process each image in the batch
-            normalized = torch.stack([normalizer.transform(img) for img in batch])
-        else:
-            # Handle numpy arrays
-            normalized = torch.from_numpy(
-                np.stack([normalizer.transform(img) for img in batch])
-            )
+        try:
+            # Use the provided normalizer
+            if isinstance(batch, torch.Tensor):
+                # Process each image in the batch
+                normalized_list = []
+                for img in batch:
+                    # Apply normalizer with error checks
+                    try:
+                        norm_img = normalizer.transform(img)
+                        normalized_list.append(norm_img)
+                    except Exception as e:
+                        print(f"Error in normalizer: {e}. Using fallback normalization.")
+                        # Fallback to simple normalization
+                        if img.max() > 100:
+                            norm_img = img / 10000.0
+                        else:
+                            norm_img = img
+                        normalized_list.append(norm_img)
+                
+                normalized = torch.stack([torch.as_tensor(img, dtype=torch.float32) 
+                                         for img in normalized_list])
+            else:
+                # Handle numpy arrays
+                normalized = torch.from_numpy(
+                    np.stack([normalizer.transform(img) for img in batch])
+                )
+        except Exception as e:
+            print(f"Critical error in normalization: {e}. Using safe defaults.")
+            # Most robust fallback - just scale values to a safe range
+            normalized = batch / 10000.0 if batch.max() > 100 else batch
+
+    # Final safety check - catch any remaining NaNs
+    if torch.isnan(normalized).any() or torch.isinf(normalized).any():
+        print("WARNING: Normalized result contains NaN/Inf. Using basic scaling.")
+        normalized = batch / 10000.0 if batch.max() > 100 else batch / (batch.max() + 1e-8)
 
     # Move to device if specified
     if device is not None:

@@ -36,19 +36,6 @@
     "use_normalizer": true
   },
   {
-    "name": "sgd_momentum",
-    "learning_rate": 5e-3,
-    "encoder_lr_factor": 0.1,
-    "optimizer": "sgd",
-    "momentum": 0.9,
-    "scheduler": "onecycle",
-    "freeze_backbone": true,
-    "progressive_unfreeze": false,
-    "weight_decay": 1e-4,
-    "description": "SGD with momentum optimizer",
-    "use_normalizer": true
-  },
-  {
     "name": "cosine_annealing",
     "learning_rate": 2e-4,
     "encoder_lr_factor": 0.1,

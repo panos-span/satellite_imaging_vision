@@ -102,7 +102,7 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=8, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=30, help="Maximum number of training epochs"
+        "--num_epochs", type=int, default=20, help="Maximum number of training epochs"
     )
     parser.add_argument(
         "--early_stopping",

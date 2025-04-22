@@ -234,7 +234,7 @@ def find_unique_class_values(mask_path, sample_limit=None):
     need_remapping = is_sparse or not (0 in sorted_values and sorted_values[0] == 0)
 
     return {
-        "unique_values": sorted_values.tolist(),
+        "unique_values": sorted_values,
         "distribution": distribution,
         "num_classes": len(sorted_values),
         "is_consecutive": is_consecutive,
@@ -667,20 +667,28 @@ def main():
     with open(info_path, "w") as f:
         # Convert numpy values to Python native types for JSON serialization
         json_info = {}
-        for k, v in dataset_info.items():
-            if isinstance(v, np.ndarray):
-                json_info[k] = v.tolist()
-            elif isinstance(v, dict):
-                # Handle nested dicts
-                json_info[k] = {}
-                for kk, vv in v.items():
-                    if isinstance(vv, np.ndarray):
-                        json_info[k][kk] = vv.tolist()
-                    else:
-                        json_info[k][kk] = vv
+        
+        def convert_numpy_types(obj):
+            """Helper function to convert numpy types to Python native types."""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8, np.uint8)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+                return float(obj)
+            elif isinstance(obj, (np.bool_)):
+                return bool(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(i) for i in obj]
             else:
-                json_info[k] = v
-
+                return obj
+        
+        # Apply conversion to all items
+        json_info = convert_numpy_types(dataset_info)
+        
+        # Save to JSON
         json.dump(json_info, f, indent=4)
 
     print(f"Dataset information saved to {info_path}")

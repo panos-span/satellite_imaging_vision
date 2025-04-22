@@ -1,0 +1,6 @@
+2025-04-10 21:25:32,838 - data_preparation - INFO - ================================================================================
+2025-04-10 21:25:32,839 - data_preparation - INFO -                       Sentinel-2 Data Preparation Pipeline                      
+2025-04-10 21:25:32,839 - data_preparation - INFO - ================================================================================
+2025-04-10 21:25:32,839 - data_preparation - INFO - 
+Step 1: Checking Sentinel-2 data...
+2025-04-10 21:25:32,891 - rasterio._env - INFO - GDAL signalled an error: err_no=4, msg='ground_truth.tif: No such file or directory'
