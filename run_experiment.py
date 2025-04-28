@@ -72,18 +72,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Validate dataset for invalid class indices",
     )
-    parser.add_argument(
-        "--ignore_index",
-        type=int,
-        default=-100,
-        help="Index to ignore in loss calculation",
-    )
-    parser.add_argument(
-        "--class_safety_margin",
-        type=int,
-        default=2,
-        help="Add safety margin to auto-detected number of classes",
-    )
+    #parser.add_argument(
+    #    "--ignore_index",
+    #    type=int,
+    #    default=-100,
+    #    help="Index to ignore in loss calculation",
+    #)
+    #parser.add_argument(
+    #    "--class_safety_margin",
+    #    type=int,
+    #    default=2,
+    #    help="Add safety margin to auto-detected number of classes",
+    #)
     parser.add_argument(
         "--auto_detect_classes",
         action="store_true",
@@ -107,7 +107,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--early_stopping",
         type=int,
-        default=7,
+        default=5,
         help="Number of epochs without improvement to trigger early stopping",
     )
     parser.add_argument(

@@ -124,17 +124,18 @@ def get_train_transform(p=0.5, patch_size=256, use_copy_paste=False, object_clas
                 print("Warning: CopyPaste augmentation not available. Continuing without it.")
                 LandCoverCopyPaste = None
                 
-        # Add CopyPaste to the transforms list
-        transforms_list.append(
-            LandCoverCopyPaste(
-                object_classes=object_classes,
-                p=0.5,
-                max_objects_per_image=3,
-                min_object_area=100,
-                max_object_area=patch_size * patch_size // 4,  # Max 1/4 of the image
-                blend_mode='gaussian'
+            # Define rare classes that need more augmentation
+            rare_classes = [0, 2, 3, 5, 6, 8]  # Corresponding to 0, 20, 30, 50, 60, 90
+            
+            transforms_list.append(
+                LandCoverCopyPaste(
+                    object_classes=rare_classes,  # Focus on rare classes
+                    p=0.7,  # Increase from 0.5
+                    max_objects_per_image=5,  # Increase from 3
+                    min_object_area=50,  # Decrease from 100
+                    blend_mode='gaussian'
+                )
             )
-        )
     
     # Combine all transforms
     transform = A.Compose(transforms_list)

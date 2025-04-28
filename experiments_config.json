@@ -1,6 +1,6 @@
 [
   {
-    "name": "frozen_backbone_onecycle",
+    "name": "frozen_backbone_onecycle_skip4",
     "learning_rate": 5e-4,
     "encoder_lr_factor": 0.0,
     "optimizer": "adam",
@@ -8,11 +8,12 @@
     "freeze_backbone": true,
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
+    "skip_connections": 4,
     "description": "Frozen backbone with OneCycle learning rate scheduler",
     "use_normalizer": true
   },
   {
-    "name": "progressive_unfreeze",
+    "name": "progressive_unfreeze_skip4",
     "learning_rate": 1e-3,
     "encoder_lr_factor": 0.1,
     "optimizer": "adam",
@@ -20,11 +21,12 @@
     "freeze_backbone": true,
     "progressive_unfreeze": true,
     "weight_decay": 1e-4,
+    "skip_connections": 4,
     "description": "Progressive unfreezing starting from frozen backbone",
     "use_normalizer": true
   },
   {
-    "name": "fine_tuning",
+    "name": "fine_tuning_skip4",
     "learning_rate": 1e-4,
     "encoder_lr_factor": 0.1,
     "optimizer": "adam",
@@ -32,11 +34,12 @@
     "freeze_backbone": false,
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
+    "skip_connections": 4,
     "description": "Fine-tuning entire network with lower encoder LR",
     "use_normalizer": true
   },
   {
-    "name": "cosine_annealing",
+    "name": "cosine_annealing_skip4",
     "learning_rate": 2e-4,
     "encoder_lr_factor": 0.1,
     "optimizer": "adam",
@@ -45,11 +48,12 @@
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
     "min_lr": 1e-6,
+    "skip_connections": 4,
     "description": "Cosine annealing scheduler with partial backbone training",
     "use_normalizer": true
   },
   {
-    "name": "high_lr_frozen",
+    "name": "high_lr_frozen_skip3",
     "learning_rate": 1e-3,
     "encoder_lr_factor": 0.0,
     "optimizer": "adam",
@@ -57,11 +61,12 @@
     "freeze_backbone": true,
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
-    "description": "Completely frozen backbone with higher learning rate",
+    "skip_connections": 3,
+    "description": "Completely frozen backbone with higher learning rate and 3 skip connections",
     "use_normalizer": true
   },
   {
-    "name": "plateau_scheduler",
+    "name": "plateau_scheduler_skip3",
     "learning_rate": 3e-4,
     "encoder_lr_factor": 0.1,
     "optimizer": "adam",
@@ -71,11 +76,12 @@
     "freeze_backbone": true,
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
-    "description": "ReduceLROnPlateau scheduler for adaptive learning rates",
+    "skip_connections": 3,
+    "description": "ReduceLROnPlateau scheduler with 3 skip connections",
     "use_normalizer": true
   },
   {
-    "name": "low_weight_decay",
+    "name": "low_weight_decay_skip3",
     "learning_rate": 5e-4,
     "encoder_lr_factor": 0.1,
     "optimizer": "adam",
@@ -83,11 +89,12 @@
     "freeze_backbone": true,
     "progressive_unfreeze": false,
     "weight_decay": 1e-5,
-    "description": "Lower weight decay for less regularization",
+    "skip_connections": 3,
+    "description": "Lower weight decay with 3 skip connections",
     "use_normalizer": true
   },
   {
-    "name": "higher_encoder_lr",
+    "name": "higher_encoder_lr_skip2",
     "learning_rate": 5e-4,
     "encoder_lr_factor": 0.3,
     "optimizer": "adam",
@@ -95,7 +102,47 @@
     "freeze_backbone": true,
     "progressive_unfreeze": false,
     "weight_decay": 1e-4,
-    "description": "Higher learning rate for encoder relative to decoder",
+    "skip_connections": 2,
+    "description": "Higher encoder LR with minimum skip connections (2)",
+    "use_normalizer": true
+  },
+  {
+    "name": "fine_tuning_skip2",
+    "learning_rate": 1e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": false,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "skip_connections": 2,
+    "description": "Fine-tuning with minimum skip connections (2)",
+    "use_normalizer": true
+  },
+  {
+    "name": "progressive_unfreeze_skip3",
+    "learning_rate": 1e-3,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": true,
+    "weight_decay": 1e-4,
+    "skip_connections": 3,
+    "description": "Progressive unfreezing with 3 skip connections",
+    "use_normalizer": true
+  },
+  {
+    "name": "skip_connections_comparison_high_lr",
+    "learning_rate": 8e-4,
+    "encoder_lr_factor": 0.2,
+    "optimizer": "adam",
+    "scheduler": "onecycle",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "skip_connections": 2,
+    "description": "Higher LR with minimal skip connections to test feature fusion impact",
     "use_normalizer": true
   }
 ]

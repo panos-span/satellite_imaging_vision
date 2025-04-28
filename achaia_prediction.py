@@ -10,7 +10,6 @@ It implements memory-efficient processing for large images and handles the full
 Sentinel-2 workflow from extraction to prediction.
 
 Usage:
-    python achaia_prediction.py --model_path "F:\\processed_data\experiment_results\experiments\fine_tuning\unet_sentinel2_best.pth" --input_path pred.zip --reference_path GBDA24_ex2_34SEH_ref_data.tif --output_dir "F:\\prediction"
 """
 
 import os

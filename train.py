@@ -21,6 +21,7 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 import argparse
+import numpy as np
 
 import wandb
 from dataset.augmentation import get_train_transform, get_val_transform
@@ -195,7 +196,7 @@ def train_epoch(
 
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast(device_type='cuda'):
+                with autocast(device_type="cuda"):
                     # Forward pass
                     outputs = model(images)
                     loss = criterion(outputs, masks)
@@ -281,7 +282,7 @@ def validate(
 
                 # Mixed precision inference
                 if use_amp:
-                    with autocast(device_type='cuda'):
+                    with autocast(device_type="cuda"):
                         outputs = model(images)
                         loss = criterion(outputs, masks)
                 else:
@@ -1110,7 +1111,32 @@ def main(args):
 
     # Create loss function with ignore_index for invalid labels
     if args.num_classes > 1:
-        criterion = nn.CrossEntropyLoss()
+        # Calculate class weights based on inverse frequency
+        class_counts = {i: 0 for i in range(args.num_classes)}
+
+        # Sample the dataset to get class distribution
+        for i in range(min(500, len(data_loaders["train"].dataset))):
+            _, mask = data_loaders["train"].dataset[i]
+            unique, counts = np.unique(mask.numpy(), return_counts=True)
+            for cls, count in zip(unique, counts):
+                if 0 <= cls < args.num_classes:
+                    class_counts[cls] += count
+
+        # Create weight tensor with inverse frequency weighting
+        total_pixels = sum(class_counts.values())
+        class_weights = torch.tensor(
+            [
+                total_pixels / (args.num_classes * max(count, 1))
+                for cls, count in class_counts.items()
+            ],
+            dtype=torch.float32,
+        ).to(device)
+
+        print(f"Class counts: {class_counts}")
+        print(f"Using class weights: {class_weights}")
+
+        # Use weighted CrossEntropyLoss
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
     else:
         criterion = nn.BCEWithLogitsLoss()
 
