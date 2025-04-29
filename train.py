@@ -33,8 +33,6 @@ from dataset.normalizers import load_sentinel2_normalizer, normalize_batch
 from dataset.utils import detect_classes_from_dataset
 from models.unet import UNet
 
-# TODO: Check normalization of data (check prepare_dataset.py for normalization)
-
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -629,7 +627,7 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
     # Inspect dataset masks to detect issues - ADDED FROM MAIN
     print("\nInspecting dataset for mask issues...")
     train_inspection = inspect_dataset_masks(
-        data_loaders["train"].dataset, num_samples=50
+        data_loaders["train"].dataset, num_samples=500
     )
 
     # Initialize class remapper if sparse indices detected - ADDED FROM MAIN
@@ -637,7 +635,7 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
     if train_inspection.get("sparse_indices", False):
         print("\nDetected sparse class indices. Creating class remapper...")
         class_remapper = create_class_remapper(
-            data_loaders["train"].dataset, num_samples=100
+            data_loaders["train"].dataset, num_samples=500
         )
 
         # Update number of classes based on remapped classes
