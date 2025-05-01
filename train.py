@@ -27,7 +27,7 @@ import wandb
 from dataset.augmentation import get_train_transform, get_val_transform
 from dataset.class_remapper import create_class_remapper
 from dataset.mask_handler import clean_mask, inspect_dataset_masks
-from dataset.metrics import create_metrics
+from dataset.metrics import create_metrics, BalancedFocalLoss, calculate_balanced_alpha
 from dataset.patch_dataset import create_patch_data_loaders
 from dataset.normalizers import load_sentinel2_normalizer, normalize_batch
 from dataset.utils import detect_classes_from_dataset
@@ -171,11 +171,14 @@ def train_epoch(
 
     # Reset metrics at the start of epoch
     metrics.reset()
+    
+    # Zero gradients at the beginning
+    optimizer.zero_grad(set_to_none=True)  # Memory efficient
 
     with tqdm(dataloader, desc="Training") as pbar:
         for images, masks in pbar:
             batch_count += 1
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)  # Non-blocking for speed
 
             # Apply normalization - this is the key addition
             if normalizer is not None:
@@ -194,7 +197,7 @@ def train_epoch(
 
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast(device_type="cuda"):
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
                     # Forward pass
                     outputs = model(images)
                     loss = criterion(outputs, masks)
@@ -753,8 +756,25 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
         )
 
         # Create loss function
-        criterion = (
-            nn.CrossEntropyLoss() if args.num_classes > 1 else nn.BCEWithLogitsLoss()
+        #criterion = (
+        #    nn.CrossEntropyLoss() if args.num_classes > 1 else nn.BCEWithLogitsLoss()
+        #)
+        # 1) compute pixel-counts per class over up to 500 samples
+        class_counts = np.zeros(args.num_classes, dtype=np.int64)
+        for i in range(min(500, len(data_loaders["train"].dataset))):
+            _, mask = data_loaders["train"].dataset[i]
+            unique, counts = np.unique(mask.numpy(), return_counts=True)
+            for cls, cnt in zip(unique, counts):
+                if 0 <= cls < args.num_classes:
+                    class_counts[cls] += cnt
+
+        alpha = calculate_balanced_alpha(class_counts)
+        print(f"Using focal-loss α: {alpha}")
+
+        criterion = BalancedFocalLoss(
+            alpha=torch.tensor(alpha, dtype=torch.float32, device=device),
+            gamma=2.0,
+            reduction="mean",
         )
 
         # Create scheduler
@@ -1110,31 +1130,48 @@ def main(args):
     # Create loss function with ignore_index for invalid labels
     if args.num_classes > 1:
         # Calculate class weights based on inverse frequency
-        class_counts = {i: 0 for i in range(args.num_classes)}
+        #class_counts = {i: 0 for i in range(args.num_classes)}
+#
+        ## Sample the dataset to get class distribution
+        #for i in range(min(500, len(data_loaders["train"].dataset))):
+        #    _, mask = data_loaders["train"].dataset[i]
+        #    unique, counts = np.unique(mask.numpy(), return_counts=True)
+        #    for cls, count in zip(unique, counts):
+        #        if 0 <= cls < args.num_classes:
+        #            class_counts[cls] += count
+#
+        ## Create weight tensor with inverse frequency weighting
+        #total_pixels = sum(class_counts.values())
+        #class_weights = torch.tensor(
+        #    [
+        #        total_pixels / (args.num_classes * max(count, 1))
+        #        for cls, count in class_counts.items()
+        #    ],
+        #    dtype=torch.float32,
+        #).to(device)
+        
+        #print(f"Class counts: {class_counts}")
+        #print(f"Using class weights: {class_weights}")
 
-        # Sample the dataset to get class distribution
+        # Use weighted CrossEntropyLoss
+        #criterion = nn.CrossEntropyLoss(weight=class_weights)
+        
+        # 1) compute pixel-counts per class over up to 500 samples
+        class_counts = np.zeros(args.num_classes, dtype=np.int64)
         for i in range(min(500, len(data_loaders["train"].dataset))):
             _, mask = data_loaders["train"].dataset[i]
             unique, counts = np.unique(mask.numpy(), return_counts=True)
-            for cls, count in zip(unique, counts):
+            for cls, cnt in zip(unique, counts):
                 if 0 <= cls < args.num_classes:
-                    class_counts[cls] += count
-
-        # Create weight tensor with inverse frequency weighting
-        total_pixels = sum(class_counts.values())
-        class_weights = torch.tensor(
-            [
-                total_pixels / (args.num_classes * max(count, 1))
-                for cls, count in class_counts.items()
-            ],
-            dtype=torch.float32,
-        ).to(device)
-
-        print(f"Class counts: {class_counts}")
-        print(f"Using class weights: {class_weights}")
-
-        # Use weighted CrossEntropyLoss
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+                    class_counts[cls] += cnt
+        
+        alpha = calculate_balanced_alpha(class_counts)
+        print(f"Using focal-loss α: {alpha}")
+        criterion = BalancedFocalLoss(
+            alpha=torch.tensor(alpha, dtype=torch.float32, device=device),
+            gamma=2.0,
+            reduction="mean",
+        )
     else:
         criterion = nn.BCEWithLogitsLoss()
 
@@ -1328,7 +1365,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--patch_size", type=int, default=256, help="Patch size")
     parser.add_argument(
-        "--num_workers", type=int, default=4, help="Number of workers for data loading"
+        "--num_workers", type=int, default=2, help="Number of workers for data loading"
     )
     parser.add_argument(
         "--use_copy_paste", action="store_true", help="Use CopyPaste augmentation"

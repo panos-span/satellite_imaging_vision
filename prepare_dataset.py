@@ -15,6 +15,10 @@ import json
 import rasterio
 import pickle
 
+"""
+python prepare_dataset.py --image_path "F:\processed_data\processed_data\dataset\sentinel_image.tif" --mask_path "F:\processed_data\processed_data\dataset\ground_truth.tif" --validity_mask_path "F:\processed_data\processed_data\dataset\validity_mask.tif" --output_dir "F:\processed_data\training_dataset_new" --patch_size 512 --overlap 128 --val_split 0.15 --test_split 0.15 --force_include_zero --normalize_method pretrained --torchgeo_compatible --focus_rare_classes
+"""
+
 # Import custom modules
 try:
     from dataset_splitter import create_patch_based_splits
@@ -112,6 +116,13 @@ def parse_args():
         default=None,
         help="Limit number of samples to analyze for class detection",
     )
+    
+    parser.add_argument(
+        "--focus_rare_classes",
+        action="store_true",
+        help="Add extra patches centered on rare classes (50, 90)"
+    )
+    
 
     return parser.parse_args()
 
@@ -379,6 +390,64 @@ def save_remapped_mask(mask_path, remapped_mask, output_path):
     # Save remapped mask with original metadata
     with rasterio.open(output_path, "w", **profile) as dst:
         dst.write(remapped_mask, 1)
+        
+def ensure_rare_class_representation(mask_path, rare_class_values, patch_size=512):
+    """
+    Explicitly identify patches containing rare classes to ensure they're included in the dataset.
+    
+    Parameters:
+    -----------
+    mask_path : str
+        Path to the mask file (can be the original or remapped mask)
+    rare_class_values : list
+        List of rare class values to look for
+    patch_size : int
+        Size of patches to extract
+    
+    Returns:
+    --------
+    list
+        List of additional (y_start, x_start) coordinates for patches containing rare classes
+    """
+    print(f"\nFinding additional patches containing rare classes: {rare_class_values}")
+    
+    with rasterio.open(mask_path) as src:
+        mask_data = src.read(1)
+        height, width = mask_data.shape
+    
+    # Find locations of rare classes
+    rare_class_patches = []
+    
+    for rare_class in rare_class_values:
+        # Find pixels with this rare class
+        y_coords, x_coords = np.where(mask_data == rare_class)
+        
+        if len(y_coords) > 0:
+            print(f"Found {len(y_coords)} pixels of class {rare_class}")
+            
+            # Sample up to 30 locations for each rare class
+            num_samples = min(30, len(y_coords))
+            sample_indices = np.random.choice(len(y_coords), num_samples, replace=False)
+            
+            for idx in sample_indices:
+                y, x = y_coords[idx], x_coords[idx]
+                
+                # Create a patch centered on this rare class pixel
+                y_start = max(0, y - patch_size // 2)
+                if y_start + patch_size > height:
+                    y_start = height - patch_size
+                
+                x_start = max(0, x - patch_size // 2)
+                if x_start + patch_size > width:
+                    x_start = width - patch_size
+                
+                # Add to our list of rare class patches
+                rare_class_patches.append((y_start, x_start))
+    
+    # Remove duplicates by converting to set and back to list
+    rare_class_patches = list(set(rare_class_patches))
+    print(f"Found {len(rare_class_patches)} additional patches centered on rare classes")
+    return rare_class_patches
 
 
 def create_remapped_dataset(args):
@@ -500,12 +569,36 @@ def create_remapped_dataset(args):
 
         print(f"Class mapping saved to {mapping_path}")
         print(f"Inverse mapping saved to {inverse_path}")
+        
+    # Add this section: Find additional patches containing rare classes
+    # Identify rare classes (after remapping)
+    rare_classes = []
+    if need_remapping and mapping_info is not None:
+        # Find remapped values for classes 50 and 90
+        for orig_class_str, new_class in mapping_info["class_mapping"].items():
+            orig_class = int(orig_class_str)
+            if orig_class in [50, 60, 80, 90]:  # The original very rare classes
+                rare_classes.append(new_class)
+    else:
+        # If no remapping, use original class values
+        rare_classes = [50, 60, 80, 90]
+    
+    # Find additional patches centered on rare classes
+    mask_path_to_use = remapped_mask_path if need_remapping else args.mask_path
+    if args.focus_rare_classes:
+        rare_class_patches = ensure_rare_class_representation(
+            mask_path_to_use, 
+            rare_classes,
+            patch_size=args.patch_size
+        )
+    else:
+        rare_class_patches = []
 
     # Step 4: Create patch-based dataset splits
     print("\nCreating patch-based dataset splits...")
     splits_info = create_patch_based_splits(
         image_path=args.image_path,
-        mask_path=remapped_mask_path,  # Use remapped mask if created
+        mask_path=remapped_mask_path if need_remapping else args.mask_path,
         validity_mask_path=args.validity_mask_path,
         output_dir=args.output_dir,
         patch_size=args.patch_size,
@@ -513,6 +606,7 @@ def create_remapped_dataset(args):
         test_split=args.test_split,
         overlap=args.overlap,
         stratify=True,
+        additional_patches=rare_class_patches  # Pass the additional patches
     )
 
     # Update splits info with class information for the model
@@ -556,7 +650,7 @@ def create_remapped_dataset(args):
             num_workers=4,
         )
 
-        print(f"Created data loaders with:")
+        print("Created data loaders with:")
         print(f"  {len(data_loaders['train'].dataset)} training samples")
         print(f"  {len(data_loaders['val'].dataset)} validation samples")
         print(f"  {len(data_loaders['test'].dataset)} test samples")

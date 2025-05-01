@@ -5,10 +5,7 @@ import random
 import numpy as np
 import cv2
 import albumentations as A
-from albumentations.augmentations.geometric.transforms import Affine
 from albumentations.core.transforms_interface import DualTransform
-from typing import Dict, List, Optional, Tuple, Union
-import skimage.measure
 
 
 class RGBTransformWrapper(DualTransform):
@@ -53,9 +50,9 @@ class RGBTransformWrapper(DualTransform):
         return ("rgb_transform", "rgb_indices")
 
 
-def get_train_transform(p=0.5, patch_size=256, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
+def get_train_transform(p=0.5, patch_size=768, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
     """
-    Get a set of data augmentations for training.
+    Get a memory-efficient set of data augmentations for training.
     """
     # Import CopyPaste only when needed
     if use_copy_paste:
@@ -72,85 +69,82 @@ def get_train_transform(p=0.5, patch_size=256, use_copy_paste=False, object_clas
             # Default to classes 1+ (assuming 0 is background)
             object_classes = list(range(1, 10))  # Adjust based on your dataset
     
-    # Create separate RGB-specific transforms
+    # Create separate RGB-specific transforms - keeping these simple
     rgb_only_transforms = A.Compose([
-        A.CLAHE(p=0.5, clip_limit=4.0),
         A.HueSaturationValue(p=0.3, hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10),
+        # Removed CLAHE which can be memory intensive
     ])
     
-    # Geometric augmentations (safe for any number of channels)
+    # Memory-efficient geometric augmentations
     transforms_list = [
-        # Flip and rotate
+        # Basic flips and rotations (memory efficient)
         A.HorizontalFlip(p=p),
         A.VerticalFlip(p=p),
         A.RandomRotate90(p=p),
         
-        # Size transformations
+        # Simple resizing instead of complex cropping/padding operations
         A.Resize(height=patch_size, width=patch_size),
         
-        # Elastic-type transformations
-        A.ElasticTransform(p=0.2, alpha=120, sigma=120 * 0.05),
-        A.GridDistortion(p=0.2),
+        # Limit memory-intensive transforms to lower probability
+        # Only include ElasticTransform OR GridDistortion, not both
+        A.OneOf([
+            A.ElasticTransform(p=1.0, alpha=60, sigma=60 * 0.05),  # Reduced complexity
+            A.GridDistortion(p=1.0, num_steps=5),  # Reduced grid complexity
+        ], p=0.2),  # Lower probability for these expensive operations
         
-        # Distortion and rotation
-        A.Affine(p=0.3, scale=(0.9, 1.1), translate_percent=(-0.0625, 0.0625), rotate=(-45, 45)),
+        # Simpler affine transform with limited parameters
+        A.ShiftScaleRotate(p=0.3, scale_limit=0.1, rotate_limit=15),  # More efficient than full Affine
         
-        # Generic radiometric augmentations (work with any number of channels)
-        A.RandomBrightnessContrast(p=p, brightness_limit=0.2, contrast_limit=0.2),
-        A.GaussNoise(p=0.2, std_range=(0.01, 0.05)),
-        A.GaussianBlur(p=0.2, blur_limit=(3, 5)),
-        A.RandomGamma(p=0.2, gamma_limit=(80, 120)),
+        # Basic radiometric augmentations (memory efficient)
+        A.RandomBrightnessContrast(p=p),
         
-        # Channel operations for multispectral
-        A.ChannelShuffle(p=0.1),
-        A.ChannelDropout(p=0.1, channel_drop_range=(1, 2), fill=0),
+        # Avoid memory-intensive GaussianBlur and use ChannelDropout with lower probability
+        A.ChannelDropout(p=0.05, channel_drop_range=(1, 1), fill=0),  # Reduced probability and range
         
         # RGB-specific transformations (using our wrapper)
         RGBTransformWrapper(
             rgb_transform=rgb_only_transforms,
             rgb_indices=rgb_indices,
-            p=0.5
+            p=0.3  # Reduced probability
         ),
     ]
     
-    # Add CopyPaste augmentation if requested
-    if use_copy_paste:
-        try:
-            from dataset.copy_paste_augmentation import LandCoverCopyPaste
-        except ImportError:
-            try:
-                from copy_paste_augmentation import LandCoverCopyPaste
-            except ImportError:
-                print("Warning: CopyPaste augmentation not available. Continuing without it.")
-                LandCoverCopyPaste = None
-                
-            # Define rare classes that need more augmentation
-            rare_classes = [0, 2, 3, 5, 6, 8]  # Corresponding to 0, 20, 30, 50, 60, 90
-            
-            transforms_list.append(
-                LandCoverCopyPaste(
-                    object_classes=rare_classes,  # Focus on rare classes
-                    p=0.7,  # Increase from 0.5
-                    max_objects_per_image=5,  # Increase from 3
-                    min_object_area=50,  # Decrease from 100
-                    blend_mode='gaussian'
-                )
+    # Add CopyPaste augmentation if requested, but with reduced parameters
+    if use_copy_paste and LandCoverCopyPaste is not None:
+        # Define rare classes that need more augmentation
+        rare_classes = [5, 6, 8]  # Most rare classes
+        
+        transforms_list.append(
+            LandCoverCopyPaste(
+                object_classes=rare_classes,
+                p=0.3,  # Reduced probability
+                max_objects_per_image=3,  # Reduced from 5
+                min_object_area=100,
+                blend_mode='normal'  # Simpler blending mode
             )
+        )
     
-    # Combine all transforms
-    transform = A.Compose(transforms_list)
+    # Use memory efficient defaults for composition
+    transform = A.Compose(
+        transforms_list,
+        # Force boolean mask output type for efficiency
+        bbox_params=None,  # No bounding box transforms
+        keypoint_params=None,  # No keypoint transforms
+        additional_targets=None  # No additional targets
+    )
     
     return transform
 
 
-def get_val_transform(patch_size=256):
+def get_val_transform(patch_size=768):
     """
-    Get a set of minimal transforms for validation/testing.
+    Get memory-efficient validation transforms.
     """
-    # For validation, we typically don't apply heavy augmentations
-    # Just ensure the size is consistent
+    # For validation, use simple resizing instead of cropping
+    # This is more memory efficient for large patches
     transform = A.Compose([
-        A.CenterCrop(height=patch_size, width=patch_size, p=1.0),
+        A.Resize(height=patch_size, width=patch_size, p=1.0),
+        # No other transforms needed for validation
     ])
     
     return transform
@@ -158,58 +152,39 @@ def get_val_transform(patch_size=256):
 
 def custom_multispectral_augmentation(image, mask=None, bands_to_augment=None):
     """
-    Apply custom spectral augmentations to multispectral satellite imagery.
+    Memory-efficient custom spectral augmentations.
     """
     # Convert to HWC format if needed
     if image.shape[0] < image.shape[-1]:  # CHW format
         image = np.transpose(image, (1, 2, 0))
     
-    # Default to all bands if not specified
+    # Limit bands to augment to save memory - only process key bands
     if bands_to_augment is None:
-        bands_to_augment = list(range(image.shape[-1]))
+        # If not specified, focus on important bands (RGB + a few others)
+        if image.shape[-1] > 5:
+            bands_to_augment = [0, 1, 2, 7, 11]  # RGB + NIR + SWIR
+        else:
+            bands_to_augment = list(range(image.shape[-1]))
     
     # Create a copy of the image to avoid modifying the original
     augmented_image = image.copy()
     
-    # Apply band-specific radiometric augmentations
-    for band_idx in bands_to_augment:
-        # Get the band
-        band = augmented_image[..., band_idx]
-        
-        # Skip empty bands
-        if np.all(band == 0):
-            continue
-        
-        # Apply random gamma correction
-        if random.random() < 0.3:
-            gamma = random.uniform(0.8, 1.2)
-            band = np.power(band / band.max(), gamma) * band.max() if band.max() > 0 else band
-        
-        # Apply random scaling
-        if random.random() < 0.3:
-            scale = random.uniform(0.9, 1.1)
-            band = band * scale
-        
-        # Apply random shift
-        if random.random() < 0.3:
-            shift = random.uniform(-0.05, 0.05) * band.std() if band.std() > 0 else 0
-            band = band + shift
-        
-        # Clip to valid range
-        band = np.clip(band, 0, band.max()) if band.max() > 0 else band
-        
-        # Update the band in the augmented image
-        augmented_image[..., band_idx] = band
+    # Use a simpler augmentation approach that uses less memory
+    # Apply global transformations rather than per-band to save memory
     
-    # Also apply global spectral transformations
+    # 1. Global brightness adjustment
     if random.random() < 0.3:
-        # Simulate atmospheric effects by adjusting all bands
-        atmospheric_factor = random.uniform(0.9, 1.1)
-        augmented_image = augmented_image * atmospheric_factor
+        scale = random.uniform(0.9, 1.1)
+        augmented_image = augmented_image * scale
+        
+    # 2. Global gamma correction
+    if random.random() < 0.3:
+        gamma = random.uniform(0.8, 1.2)
+        max_val = augmented_image.max() if augmented_image.max() > 0 else 1.0
+        augmented_image = np.power(augmented_image / max_val, gamma) * max_val
     
-    # Normalize to [0, 1] range for easier handling
-    if augmented_image.max() > 0:
-        augmented_image = augmented_image / augmented_image.max()
+    # Clip to valid range to avoid NaNs and Infs
+    augmented_image = np.clip(augmented_image, 0, None)
     
     # Return the augmented image and mask
     return (augmented_image, mask) if mask is not None else augmented_image
@@ -246,7 +221,7 @@ class NormalizeToPretrainedStats:
         return (normalized_image, mask) if mask is not None else normalized_image
 
 
-def get_multispectral_augmentation_pipeline(spatial_size=256, p=0.5, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
+def get_multispectral_augmentation_pipeline(spatial_size=512, p=0.5, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
     """
     Get a comprehensive augmentation pipeline for multispectral satellite imagery.
     """

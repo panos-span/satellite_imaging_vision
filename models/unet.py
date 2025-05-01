@@ -414,6 +414,12 @@ class UNet(nn.Module):
         print(
             f"- Effective receptive field: {self.receptive_field_info['effective_rf']} pixels"
         )
+        
+        # 1. Use efficient activation functions
+        nn.ReLU(inplace=True)  # Use inplace operations
+
+        # 2. Enable torch.backends optimizations
+        torch.backends.cudnn.benchmark = True
 
     def forward(self, x):
         """
@@ -496,113 +502,3 @@ class UNet(nn.Module):
             
         # All checks passed
         return True
-
-
-    # Add this debug forward method to your UNet class to identify where NaN values appear
-    #def forward(self, x):
-    #    """Forward pass with NaN checking at each stage."""
-    #    # Check input
-    #    print(f"Input shape: {x.shape}, range: [{x.min().item()}, {x.max().item()}]")
-    #    if not self.check_tensor(x, "input"):
-    #        return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    
-    #    # Store original input size
-    #    input_size = (x.shape[2], x.shape[3])
-    #    
-    #    # Encoder forward pass
-    #    try:
-    #        features = self.encoder.backbone.conv1(x)
-    #        if not self.check_tensor(features, "encoder.conv1"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #            
-    #        features = self.encoder.backbone.bn1(features)
-    #        if not self.check_tensor(features, "encoder.bn1"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #            
-    #        features = self.encoder.backbone.act1(features)
-    #        if not self.check_tensor(features, "encoder.act1"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        
-    #        # Get all encoder features
-    #        encoder_features = {}
-    #        encoder_features['stage0'] = features
-    #        
-    #        # Apply max pooling
-    #        features = self.encoder.backbone.maxpool(features)
-    #        if not self.check_tensor(features, "encoder.maxpool"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        
-    #        # Process through encoder layers
-    #        features = self.encoder.backbone.layer1(features)
-    #        if not self.check_tensor(features, "encoder.layer1"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        encoder_features['stage1'] = features
-    #        
-    #        features = self.encoder.backbone.layer2(features)
-    #        if not self.check_tensor(features, "encoder.layer2"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        encoder_features['stage2'] = features
-    #        
-    #        features = self.encoder.backbone.layer3(features)
-    #        if not self.check_tensor(features, "encoder.layer3"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        encoder_features['stage3'] = features
-    #        
-    #        features = self.encoder.backbone.layer4(features)
-    #        if not self.check_tensor(features, "encoder.layer4"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        encoder_features['stage4'] = features
-    #    except Exception as e:
-    #        print(f"Error in encoder: {e}")
-    #        return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    
-    #    # Convert encoder features to a list from deepest to shallowest
-    #    try:
-    #        features_list = [encoder_features[f'stage{i}'] for i in range(len(encoder_features))]
-    #        features_list.reverse()  # Deepest features first
-    #        
-    #        # Start with bottleneck feature
-    #        x = features_list[0]
-    #        if not self.check_tensor(x, "bottleneck"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        
-    #        # Apply decoder blocks with skip connections
-    #        for i, up_block in enumerate(self.decoder.up_blocks):
-    #            # Get appropriate skip connection if applicable
-    #            skip = None
-    #            if i < self.decoder.skip_connections and i+1 < len(features_list):
-    #                skip = features_list[i+1]
-    #                if skip is not None and not self.check_tensor(skip, f"skip_{i}"):
-    #                    skip = None
-    #            
-    #            # Pass through decoder block
-    #            try:
-    #                x = up_block(x, skip)
-    #                if not self.check_tensor(x, f"decoder_block_{i}"):
-    #                    return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #            except Exception as e:
-    #                print(f"Error in decoder block {i}: {e}")
-    #                return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    except Exception as e:
-    #        print(f"Error in decoder: {e}")
-    #        return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    
-    #    # Final classification
-    #    try:
-    #        logits = self.final_conv(x)
-    #        if not self.check_tensor(logits, "logits"):
-    #            return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #        
-    #        # Resize to original input size if necessary
-    #        if logits.shape[2:] != input_size:
-    #            logits = F.interpolate(
-    #                logits, size=input_size, mode='bilinear', align_corners=True
-    #            )
-    #            if not self.check_tensor(logits, "resized_logits"):
-    #                return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    except Exception as e:
-    #        print(f"Error in final convolution: {e}")
-    #        return torch.zeros((x.size(0), self.num_classes, x.size(2), x.size(3)), device=x.device)
-    #    
-    #    return logits
-#

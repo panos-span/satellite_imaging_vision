@@ -1,7 +1,7 @@
 [
   {
     "name": "frozen_backbone_onecycle_skip4",
-    "learning_rate": 5e-4,
+    "learning_rate": 8e-4,
     "encoder_lr_factor": 0.0,
     "optimizer": "adam",
     "scheduler": "onecycle",
@@ -10,6 +10,20 @@
     "weight_decay": 1e-4,
     "skip_connections": 4,
     "description": "Frozen backbone with OneCycle learning rate scheduler",
+    "use_normalizer": true
+  },
+  {
+    "name": "cosine_annealing_skip4",
+    "learning_rate": 2e-4,
+    "encoder_lr_factor": 0.1,
+    "optimizer": "adam",
+    "scheduler": "cosine",
+    "freeze_backbone": true,
+    "progressive_unfreeze": false,
+    "weight_decay": 1e-4,
+    "min_lr": 1e-6,
+    "skip_connections": 4,
+    "description": "Cosine annealing scheduler with partial backbone training",
     "use_normalizer": true
   },
   {
@@ -36,20 +50,6 @@
     "weight_decay": 1e-4,
     "skip_connections": 4,
     "description": "Fine-tuning entire network with lower encoder LR",
-    "use_normalizer": true
-  },
-  {
-    "name": "cosine_annealing_skip4",
-    "learning_rate": 2e-4,
-    "encoder_lr_factor": 0.1,
-    "optimizer": "adam",
-    "scheduler": "cosine",
-    "freeze_backbone": true,
-    "progressive_unfreeze": false,
-    "weight_decay": 1e-4,
-    "min_lr": 1e-6,
-    "skip_connections": 4,
-    "description": "Cosine annealing scheduler with partial backbone training",
     "use_normalizer": true
   },
   {

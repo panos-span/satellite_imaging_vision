@@ -6,22 +6,103 @@ with improved handling for multiclass segmentation and edge cases.
 """
 
 import torch
-import torchmetrics
+import numpy as np
 from torchmetrics.segmentation import MeanIoU, DiceScore
 from torchmetrics.classification import (
-    BinaryF1Score, 
+    BinaryF1Score,
     MulticlassF1Score,
-    BinaryAccuracy, 
-    MulticlassAccuracy
+    BinaryAccuracy,
+    MulticlassAccuracy,
 )
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BalancedFocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+        if alpha is not None:
+            # Ensure alpha is balanced - limit the maximum weight
+            if isinstance(alpha, torch.Tensor):
+                # Cap the maximum weight to 10x the minimum
+                min_alpha = alpha.min()
+                alpha = torch.clamp(alpha, min=min_alpha, max=min_alpha * 10)
+                # Renormalize
+                alpha = alpha / alpha.sum()
+            self.alpha = alpha
+        else:
+            self.alpha = None
+
+    def forward(self, inputs, targets):
+        # Standard focal loss implementation with balanced alpha
+        if inputs.dim() > 2:
+            # N,C,H,W => N,C,H*W
+            inputs = inputs.view(inputs.size(0), inputs.size(1), -1)
+            # N,C,H*W => N,H*W,C
+            inputs = inputs.transpose(1, 2)
+            # N,H*W,C => N*H*W,C
+            inputs = inputs.contiguous().view(-1, inputs.size(2))
+
+        targets = targets.view(-1, 1)
+
+        # Apply softmax to get probabilities
+        logpt = F.log_softmax(inputs, dim=1)
+        logpt = logpt.gather(1, targets)
+        logpt = logpt.view(-1)
+        pt = logpt.exp()
+
+        # Apply class weights
+        if self.alpha is not None:
+            alpha = self.alpha.to(inputs.device)
+            at = alpha.gather(0, targets.view(-1))
+            logpt = logpt * at
+
+        # Compute focal loss
+        loss = -1 * (1 - pt) ** self.gamma * logpt
+
+        # Apply reduction
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+
+def calculate_balanced_alpha(class_counts):
+    """Calculate balanced alpha weights for focal loss."""
+    class_counts = np.array(class_counts)
+
+    # Method 1: Square root scaling to reduce extreme values
+    # This moderates the impact of class imbalance
+    scaled_counts = np.sqrt(class_counts)
+    inv_freq = 1.0 / scaled_counts
+
+    # Method 2: Logarithmic scaling - even more moderate
+    # scaled_counts = np.log(class_counts + 1)
+    # inv_freq = 1.0 / scaled_counts
+
+    # Normalize to sum to 1
+    alpha = inv_freq / inv_freq.sum()
+
+    # Ensure no class gets more than 30% of total weight
+    alpha = np.clip(alpha, 0, 0.3)
+    alpha = alpha / alpha.sum()  # Renormalize after clipping
+
+    return alpha
+
 
 class SegmentationMetrics:
     """Class to handle both binary and multiclass segmentation metrics with improved stability."""
-    
+
     def __init__(self, num_classes=1, threshold=0.5, device=None):
         """
         Initialize segmentation metrics.
-        
+
         Parameters:
         -----------
         num_classes : int
@@ -34,7 +115,7 @@ class SegmentationMetrics:
         self.num_classes = num_classes
         self.threshold = threshold
         self.device = device if device is not None else torch.device("cpu")
-        
+
         # Initialize metrics based on number of classes
         if num_classes == 1:
             # Binary segmentation metrics
@@ -46,13 +127,17 @@ class SegmentationMetrics:
             # Multiclass segmentation metrics
             self.iou_score = MeanIoU(num_classes=num_classes).to(device)
             self.dice_score = DiceScore(num_classes=num_classes).to(device)
-            self.f1_score = MulticlassF1Score(num_classes=num_classes, average='macro').to(device)
-            self.accuracy = MulticlassAccuracy(num_classes=num_classes, average='micro').to(device)
-    
+            self.f1_score = MulticlassF1Score(
+                num_classes=num_classes, average="macro"
+            ).to(device)
+            self.accuracy = MulticlassAccuracy(
+                num_classes=num_classes, average="micro"
+            ).to(device)
+
     def update(self, outputs, targets):
         """
         Update metrics with batch of predictions and targets.
-        
+
         Parameters:
         -----------
         outputs : torch.Tensor
@@ -68,44 +153,44 @@ class SegmentationMetrics:
                     preds = (torch.sigmoid(outputs) > self.threshold).squeeze(1).long()
                 else:
                     preds = outputs  # Assume already processed
-                
+
                 # Ensure targets are in correct format (B, H, W) with class indices (0 or 1)
                 if targets.dim() == 4 and targets.shape[1] == 1:
                     targets = targets.squeeze(1).long()
-            
+
             # Handle multiclass segmentation
             else:
                 # Handle logits (B, C, H, W)
                 if outputs.dim() == 4 and outputs.shape[1] == self.num_classes:
                     # For IoU and Dice - need class indices
                     preds_indices = torch.argmax(outputs, dim=1)
-                    
+
                     # For F1 and Accuracy - need softmax probabilities
                     preds_probs = torch.softmax(outputs, dim=1)
-                    
+
                     # Use appropriate prediction format for each metric
                     self.iou_score.update(preds_indices, targets)
                     self.dice_score.update(preds_indices, targets)
                     self.f1_score.update(preds_probs, targets)
                     self.accuracy.update(preds_probs, targets)
-                    
+
                     # Exit early since we've already updated all metrics
                     return
                 else:
                     # If outputs are already class indices (B, H, W)
                     preds = outputs
-                
+
                 # Ensure targets are in correct format (B, H, W) with class indices
                 if targets.dim() == 4 and targets.shape[1] == 1:
                     targets = targets.squeeze(1).long()
                 elif targets.dim() == 4 and targets.shape[1] > 1:
                     # One-hot encoded targets, convert to indices
                     targets = torch.argmax(targets, dim=1)
-            
+
             # Update metrics (only for binary or when outputs are already indices)
             self.iou_score.update(preds, targets)
             self.dice_score.update(preds, targets)
-            
+
             # For binary or when already using indices, convert to appropriate format for F1 and Accuracy
             if self.num_classes == 1:
                 # Binary metrics need different input formats
@@ -113,50 +198,55 @@ class SegmentationMetrics:
                 self.accuracy.update(preds, targets)
             else:
                 # For multiclass with indices, we need to one-hot encode for F1 and Accuracy
-                preds_one_hot = torch.nn.functional.one_hot(preds, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+                preds_one_hot = (
+                    torch.nn.functional.one_hot(preds, num_classes=self.num_classes)
+                    .permute(0, 3, 1, 2)
+                    .float()
+                )
                 self.f1_score.update(preds_one_hot, targets)
                 self.accuracy.update(preds_one_hot, targets)
-    
+
     def compute(self):
         """
         Compute and return metrics with error handling.
-        
+
         Returns:
         --------
         dict
             Dictionary with computed metric values
         """
         try:
+            # For multiclass, compute() returns a tensor with dice for each class
+            # We should average them, not sum them
+            if self.num_classes > 1:
+                dice_tensor = self.dice_score.compute()
+                dice = torch.mean(dice_tensor).item()  # Average across classes
+            else:
+                dice = self.dice_score.compute().item()
+        except Exception as e:
+            print(f"Error computing Dice: {e}")
+            dice = 0.0
+
+        try:
             iou = self.iou_score.compute().item()
         except Exception as e:
             print(f"Error computing IoU: {e}")
             iou = 0.0
-            
-        try:
-            dice = self.dice_score.compute().item()
-        except Exception as e:
-            print(f"Error computing Dice: {e}")
-            dice = 0.0
-            
+
         try:
             f1 = self.f1_score.compute().item()
         except Exception as e:
             print(f"Error computing F1: {e}")
             f1 = 0.0
-            
+
         try:
             accuracy = self.accuracy.compute().item()
         except Exception as e:
             print(f"Error computing Accuracy: {e}")
             accuracy = 0.0
-            
-        return {
-            "iou": iou,
-            "dice": dice,
-            "f1": f1,
-            "accuracy": accuracy
-        }
-    
+
+        return {"iou": iou, "dice": dice, "f1": f1, "accuracy": accuracy}
+
     def reset(self):
         """Reset all metrics."""
         self.iou_score.reset()
@@ -168,7 +258,7 @@ class SegmentationMetrics:
 def create_metrics(num_classes=1, threshold=0.5, device=None):
     """
     Factory function to create segmentation metrics.
-    
+
     Parameters:
     -----------
     num_classes : int
@@ -177,7 +267,7 @@ def create_metrics(num_classes=1, threshold=0.5, device=None):
         Threshold for binary segmentation
     device : torch.device
         Device to use for metric computation
-        
+
     Returns:
     --------
     SegmentationMetrics

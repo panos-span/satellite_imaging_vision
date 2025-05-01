@@ -18,7 +18,6 @@ import glob
 """
 python evaluate_prediction.py --prediction "F:\output\predictions\T34SEH_land_cover_prediction.tif"     --ground_truth 
 "GBDA24_ex2_34SEH_ref_data.tif"     --mapping_file "F:\processed_data\training_dataset\inverse_class_mapping.json"     --output_dir "F:\output\predictions\evaluation_fixed"
-Loaded F:\output\predictions\T34SEH_land_cover_prediction.tif
 """
 
 def load_raster(file_path):

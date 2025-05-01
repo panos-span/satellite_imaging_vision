@@ -3,8 +3,6 @@ Utilities for splitting datasets into training, validation, and testing subsets.
 """
 import json
 import os
-import shutil
-from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -12,7 +10,7 @@ from sklearn.model_selection import train_test_split
 
 
 def create_stratified_sample_indices(mask_path, validity_mask_path=None, 
-                                    val_split=0.2, test_split=0.1, 
+                                    val_split=0.2, test_split=0.2, 
                                     stratify=True, random_state=42):
     """
     Create stratified sample indices for dataset splitting.
@@ -138,7 +136,7 @@ def create_stratified_sample_indices(mask_path, validity_mask_path=None,
 def create_patch_based_splits(image_path, mask_path, validity_mask_path=None,
                              output_dir='dataset_splits', patch_size=256, 
                              val_split=0.2, test_split=0.1, overlap=0, 
-                             stratify=True, random_state=42):
+                             stratify=True, random_state=42, additional_patches=None):
     """
     Create patch-based dataset splits for training, validation, and testing.
     
@@ -215,6 +213,14 @@ def create_patch_based_splits(image_path, mask_path, validity_mask_path=None,
             
             patches.append((y_start, x_start))
     
+    # Add additional patches if provided
+    if additional_patches:
+        print(f"Adding {len(additional_patches)} additional patches containing rare classes")
+        # Add the additional patches, avoiding duplicates
+        for patch in additional_patches:
+            if patch not in patches:
+                patches.append(patch)
+    
     print(f"Created {len(patches)} patches of size {patch_size}x{patch_size} with {overlap} overlap")
     
     # Determine valid patches based on validity mask
@@ -261,27 +267,132 @@ def create_patch_based_splits(image_path, mask_path, validity_mask_path=None,
     patch_classes = np.array(patch_classes)
     print(f"Found {len(valid_patches)} valid patches")
     
-    # Split patches into train/val/test
     if stratify and len(unique_classes) > 1:
-        # Use stratified sampling
-        indices = np.arange(len(valid_patches))
+        print("Attempting stratified split...")
         
-        # Split into train+val and test
-        train_val_indices, test_indices = train_test_split(
-            indices, test_size=test_split, random_state=random_state,
-            stratify=patch_classes
-        )
+        # Identify classes with too few samples for stratification
+        class_counts = {}
+        for cls in np.unique(patch_classes):
+            class_counts[cls] = np.sum(patch_classes == cls)
         
-        # Calculate adjusted validation split
-        adjusted_val_split = val_split / (1 - test_split)
+        # Display class distribution
+        print("Patch class distribution:")
+        for cls, count in class_counts.items():
+            print(f"  Class {cls}: {count} patches")
         
-        # Split train+val into train and val
-        train_indices, val_indices = train_test_split(
-            train_val_indices, test_size=adjusted_val_split, random_state=random_state,
-            stratify=patch_classes[train_val_indices]
-        )
+        # Check if any class has fewer than 3 samples (minimum needed for train/val/test)
+        problematic_classes = [cls for cls, count in class_counts.items() if count < 3]
+        
+        if problematic_classes:
+            print(f"Warning: Classes {problematic_classes} have fewer than 3 patches")
+            print("Using modified stratification approach")
+            
+            # Create masks for problematic and non-problematic patches
+            problematic_mask = np.zeros(len(valid_patches), dtype=bool)
+            for cls in problematic_classes:
+                problematic_mask = problematic_mask | (patch_classes == cls)
+            
+            non_problematic_mask = ~problematic_mask
+            
+            # Get indices for each group
+            problem_indices = np.where(problematic_mask)[0]
+            non_problem_indices = np.where(non_problematic_mask)[0]
+            
+            # Split non-problematic patches with stratification
+            if np.sum(non_problematic_mask) > 0:
+                non_problem_classes = patch_classes[non_problem_indices]
+                
+                # Train/val/test split for non-problematic classes
+                np_train_val, np_test = train_test_split(
+                    non_problem_indices, test_size=test_split, random_state=random_state,
+                    stratify=non_problem_classes
+                )
+                
+                # Calculate adjusted validation split
+                adjusted_val_split = val_split / (1 - test_split)
+                
+                # Split train+val
+                np_train, np_val = train_test_split(
+                    np_train_val, test_size=adjusted_val_split, random_state=random_state,
+                    stratify=non_problem_classes[np.isin(non_problem_indices, np_train_val)]
+                )
+            else:
+                np_train, np_val, np_test = [], [], []
+            
+            # Distribute problematic patches evenly
+            if len(problem_indices) > 0:
+                # Shuffle the problematic indices
+                np.random.seed(random_state)
+                np.random.shuffle(problem_indices)
+                
+                # Calculate how many go to each split
+                num_train = max(1, int(len(problem_indices) * (1 - val_split - test_split)))
+                num_val = max(1, int(len(problem_indices) * val_split))
+                
+                # If we only have 1 or 2 patches, handle specially
+                if len(problem_indices) == 1:
+                    p_train = problem_indices
+                    p_val = []
+                    p_test = []
+                elif len(problem_indices) == 2:
+                    p_train = [problem_indices[0]]
+                    p_val = [problem_indices[1]]
+                    p_test = []
+                else:
+                    # Distribute to train, val, test
+                    p_train = problem_indices[:num_train]
+                    p_val = problem_indices[num_train:num_train+num_val]
+                    p_test = problem_indices[num_train+num_val:]
+                    
+                # Report the distribution
+                for cls in problematic_classes:
+                    cls_indices = np.where(patch_classes == cls)[0]
+                    cls_train = np.sum(np.isin(cls_indices, p_train))
+                    cls_val = np.sum(np.isin(cls_indices, p_val))
+                    cls_test = np.sum(np.isin(cls_indices, p_test))
+                    print(f"  Distributed class {cls}: train={cls_train}, val={cls_val}, test={cls_test}")
+            else:
+                p_train, p_val, p_test = [], [], []
+            
+            # Combine the splits
+            train_indices = list(np_train) + list(p_train)
+            val_indices = list(np_val) + list(p_val)
+            test_indices = list(np_test) + list(p_test)
+        
+        else:
+            # Standard stratified split when all classes have enough samples
+            indices = np.arange(len(valid_patches))
+            
+            try:
+                # Split into train+val and test
+                train_val_indices, test_indices = train_test_split(
+                    indices, test_size=test_split, random_state=random_state,
+                    stratify=patch_classes
+                )
+                
+                # Calculate adjusted validation split
+                adjusted_val_split = val_split / (1 - test_split)
+                
+                # Split train+val into train and val
+                train_indices, val_indices = train_test_split(
+                    train_val_indices, test_size=adjusted_val_split, random_state=random_state,
+                    stratify=patch_classes[train_val_indices]
+                )
+            except Exception as e:
+                print(f"Stratified splitting failed with error: {e}")
+                print("Falling back to random splitting")
+                
+                # Fall back to random splitting
+                train_val_indices, test_indices = train_test_split(
+                    indices, test_size=test_split, random_state=random_state
+                )
+                
+                train_indices, val_indices = train_test_split(
+                    train_val_indices, test_size=adjusted_val_split, random_state=random_state
+                )
     else:
-        # Use random sampling
+        # Use random sampling without stratification
+        print("Using random (non-stratified) splitting")
         indices = np.arange(len(valid_patches))
         
         # Split into train+val and test
@@ -296,7 +407,7 @@ def create_patch_based_splits(image_path, mask_path, validity_mask_path=None,
         train_indices, val_indices = train_test_split(
             train_val_indices, test_size=adjusted_val_split, random_state=random_state
         )
-    
+        
     # Get patch coordinates for each split
     train_patches = [valid_patches[i] for i in train_indices]
     val_patches = [valid_patches[i] for i in val_indices]
