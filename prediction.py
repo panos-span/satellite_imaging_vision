@@ -16,6 +16,8 @@ import pickle
 import sys
 import zipfile
 from pathlib import Path
+from scipy.ndimage import uniform_filter, generic_filter
+from skimage.morphology import remove_small_objects
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,6 +53,323 @@ except ImportError:
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def spatial_context_refinement(prediction_map, window_size=7):
+    """
+    Refine predictions using spatial context.
+    
+    Parameters:
+    -----------
+    prediction_map : numpy.ndarray
+        Input prediction map
+    window_size : int
+        Size of window for context (should be odd)
+        
+    Returns:
+    --------
+    numpy.ndarray
+        Refined prediction map
+    """
+    print("Applying spatial context refinement...")
+    
+    # Create a smoothed version using a uniform filter for each class
+    unique_classes = np.unique(prediction_map)
+    class_probabilities = np.zeros((len(unique_classes), *prediction_map.shape), dtype=np.float32)
+    
+    # Create probability maps for each class
+    for i, cls in enumerate(unique_classes):
+        # Create binary mask for this class
+        binary_mask = (prediction_map == cls).astype(np.float32)
+        
+        # Apply smoothing to get spatial context
+        class_probabilities[i] = uniform_filter(binary_mask, size=window_size)
+    
+    # For each pixel, select the class with highest probability
+    refined_prediction = np.zeros_like(prediction_map)
+    best_class_idx = np.argmax(class_probabilities, axis=0)
+    
+    for i, cls in enumerate(unique_classes):
+        refined_prediction[best_class_idx == i] = cls
+    
+    # Apply majority filtering to remove isolated pixels
+    def most_common(arr):
+        values, counts = np.unique(arr, return_counts=True)
+        return values[np.argmax(counts)]
+    
+    final_prediction = generic_filter(
+        refined_prediction,
+        most_common,
+        size=3,  # Smaller window for majority filter
+        mode='nearest'
+    )
+    
+    return final_prediction
+
+
+def post_process_prediction(prediction_map, refined_mapping, window_size=7, ground_truth_info=None):
+    """
+    Apply comprehensive post-processing to improve prediction quality.
+    
+    Parameters:
+    -----------
+    prediction_map : numpy.ndarray
+        Raw prediction map from the model
+    refined_mapping : dict
+        Mapping from model classes to ground truth classes
+    window_size : int
+        Window size for spatial context refinement
+    ground_truth_info : dict, optional
+        Additional information about ground truth
+        
+    Returns:
+    --------
+    numpy.ndarray
+        Post-processed prediction map
+    """
+    print("Starting post-processing pipeline...")
+    
+    # Step 1: Apply refined mapping
+    if refined_mapping:
+        print("Applying refined class mapping...")
+        mapped_prediction = np.zeros_like(prediction_map)
+        for model_cls, gt_cls in refined_mapping.items():
+            mapped_prediction[prediction_map == model_cls] = gt_cls
+    else:
+        mapped_prediction = prediction_map.copy()
+    
+    # Step 2: Apply spatial context refinement
+    print("Applying spatial context refinement...")
+    context_refined = spatial_context_refinement(
+        mapped_prediction, 
+        window_size=window_size
+    )
+    
+    # Step 3: Remove small objects (noise)
+    print("Removing small isolated regions...")
+    
+    # Process each class separately
+    unique_classes = np.unique(context_refined)
+    cleaned_prediction = np.zeros_like(context_refined)
+    
+    for cls in unique_classes:
+        # Create binary mask for this class
+        binary_mask = (context_refined == cls)
+        
+        # Remove small objects
+        min_size = 20  # Minimum size in pixels
+        cleaned_mask = remove_small_objects(binary_mask, min_size=min_size)
+        
+        # Add back to the prediction
+        cleaned_prediction[cleaned_mask] = cls
+    
+    # Fill in any gaps created by small object removal
+    # Create a background mask of pixels that need to be filled
+    background_mask = ~np.isin(cleaned_prediction, unique_classes)
+    
+    # For background pixels, assign the class with highest probability in neighborhood
+    if np.any(background_mask):
+        print("Filling gaps in prediction...")
+        
+        # Create a distance-weighted map for each class
+        for cls in unique_classes:
+            cls_mask = (cleaned_prediction == cls)
+            
+            # Skip if class doesn't exist in prediction
+            if not np.any(cls_mask):
+                continue
+                
+            # For each unassigned pixel, check proximity to this class
+            for y, x in zip(*np.where(background_mask)):
+                # Define neighborhood window
+                y_min = max(0, y - window_size//2)
+                y_max = min(cleaned_prediction.shape[0], y + window_size//2 + 1)
+                x_min = max(0, x - window_size//2)
+                x_max = min(cleaned_prediction.shape[1], x + window_size//2 + 1)
+                
+                # Count occurrences of each class in neighborhood
+                neighborhood = cleaned_prediction[y_min:y_max, x_min:x_max]
+                unique_neighbors, counts = np.unique(neighborhood, return_counts=True)
+                
+                # Skip if no valid classes in neighborhood
+                if len(unique_neighbors) == 0 or (len(unique_neighbors) == 1 and unique_neighbors[0] == 0):
+                    continue
+                    
+                # Find most common class (excluding background)
+                valid_idx = unique_neighbors != 0
+                if np.any(valid_idx):
+                    valid_unique = unique_neighbors[valid_idx]
+                    valid_counts = counts[valid_idx]
+                    most_common_cls = valid_unique[np.argmax(valid_counts)]
+                    cleaned_prediction[y, x] = most_common_cls
+    
+    print("Post-processing complete.")
+    return cleaned_prediction
+
+
+def predict_patches_improved(model, image_path, ground_truth, num_classes, patch_size, overlap, batch_size, normalizer=None):
+    """
+    Memory-efficient prediction with improved edge handling and weighted blending.
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        Trained model
+    image_path : str
+        Path to multiband image
+    ground_truth : numpy.ndarray
+        Ground truth array for co-occurrence calculation
+    num_classes : int
+        Number of output classes
+    patch_size : int
+        Size of patches for prediction
+    overlap : int
+        Overlap between patches
+    batch_size : int
+        Batch size for prediction
+    normalizer : object, optional
+        Normalizer for image preprocessing
+        
+    Returns:
+    --------
+    tuple
+        (prediction_map, profile, co_occurrence, gt_unique)
+    """
+    print("Initializing memory-efficient prediction with improved edge handling...")
+    
+    # Open the multiband image
+    with rasterio.open(image_path) as src:
+        height = src.height
+        width = src.width
+        profile = src.profile.copy()
+        
+        # Calculate patch stride
+        stride = patch_size - overlap
+        
+        # Calculate number of patches
+        n_h = (height - overlap) // stride
+        n_w = (width - overlap) // stride
+        
+        # Adjust for edge cases
+        if (n_h * stride + overlap) < height:
+            n_h += 1
+        if (n_w * stride + overlap) < width:
+            n_w += 1
+        
+        # Gather patch coordinates
+        patches_coords = []
+        for i in range(n_h):
+            for j in range(n_w):
+                x_start = j * stride
+                y_start = i * stride
+                
+                # Adjust for right and bottom edges
+                if x_start + patch_size > width:
+                    x_start = width - patch_size
+                if y_start + patch_size > height:
+                    y_start = height - patch_size
+                
+                patches_coords.append((y_start, x_start))
+        
+        # Create empty prediction map and weight map for blending
+        prediction_map = np.zeros((num_classes, height, width), dtype=np.float32)
+        weight_map = np.zeros((height, width), dtype=np.float32)
+        
+        # Create empty co-occurrence matrix
+        gt_unique = np.unique(ground_truth)
+        co_occurrence = np.zeros((num_classes, len(gt_unique)), dtype=np.int64)
+        
+        print(f"Processing {len(patches_coords)} patches...")
+        
+        # Create a weight matrix for blending that gives less weight to patch edges
+        patch_weight = np.ones((patch_size, patch_size), dtype=np.float32)
+        y_coords = np.linspace(-1, 1, patch_size)
+        x_coords = np.linspace(-1, 1, patch_size)
+        X, Y = np.meshgrid(x_coords, y_coords)
+        # Create a radial falloff from center (1.0) to edges
+        r = np.sqrt(X**2 + Y**2) 
+        patch_weight = np.clip(1.0 - r, 0.2, 1.0)
+        
+        # Process patches in batches
+        batch_idx = 0
+        for i in range(0, len(patches_coords), batch_size):
+            batch_coords = patches_coords[i:i+batch_size]
+            batch_images = []
+            
+            # Load batch patches
+            for y_start, x_start in batch_coords:
+                # Read window
+                window = Window(x_start, y_start, patch_size, patch_size)
+                patch = src.read(window=window)
+                batch_images.append(patch)
+            
+            # Stack and convert to tensor
+            batch_tensor = torch.from_numpy(np.stack(batch_images)).float()
+            
+            # Apply normalization
+            if normalizer is not None:
+                batch_tensor = normalize_batch(batch_tensor, normalizer, device)
+            else:
+                # Simple default normalization
+                batch_tensor = batch_tensor / 10000.0
+            
+            # Move to device
+            batch_tensor = batch_tensor.to(device)
+            
+            # Make predictions
+            with torch.no_grad():
+                outputs = model(batch_tensor)
+                
+                # Get probabilities
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                
+                # Get class predictions for co-occurrence matrix
+                predictions = np.argmax(probs, axis=1)
+                
+                # Update the prediction map with weighted probabilities
+                for idx, (y_start, x_start) in enumerate(batch_coords):
+                    # Update prediction map (using soft probabilities)
+                    for cls in range(num_classes):
+                        cls_prob = probs[idx, cls]
+                        weighted_prob = cls_prob * patch_weight
+                        prediction_map[cls, y_start:y_start+patch_size, x_start:x_start+patch_size] += weighted_prob
+                    
+                    # Update weight map
+                    weight_map[y_start:y_start+patch_size, x_start:x_start+patch_size] += patch_weight
+                    
+                    # Update co-occurrence matrix
+                    gt_patch = ground_truth[y_start:y_start+patch_size, x_start:x_start+patch_size]
+                    pred_patch = predictions[idx]
+                    
+                    # For each GT class in the patch
+                    for gt_idx, gt_cls in enumerate(gt_unique):
+                        gt_mask = gt_patch == gt_cls
+                        if not np.any(gt_mask):
+                            continue
+                            
+                        # For each prediction class
+                        for pred_cls in range(num_classes):
+                            pred_mask = pred_patch == pred_cls
+                            overlap = np.sum(gt_mask & pred_mask)
+                            co_occurrence[pred_cls, gt_idx] += overlap
+            
+            # Print progress
+            batch_idx += 1
+            if batch_idx % 10 == 0:
+                print(f"Processed {batch_idx * batch_size}/{len(patches_coords)} patches")
+        
+        # Normalize the prediction map by the weight map
+        valid_mask = weight_map > 0
+        final_pred_map = np.zeros((height, width), dtype=np.int32)
+        
+        for y in range(height):
+            for x in range(width):
+                if valid_mask[y, x]:
+                    # Get all class probabilities at this pixel
+                    pixel_probs = prediction_map[:, y, x] / weight_map[y, x]
+                    # Assign the class with the highest probability
+                    final_pred_map[y, x] = np.argmax(pixel_probs)
+    
+    return final_pred_map, profile, co_occurrence, gt_unique
 
 def create_refined_mapping(co_occurrence, gt_unique, num_classes):
     """
@@ -118,6 +437,20 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Sentinel-2 land cover classification prediction"
     )
+    
+    parser.add_argument(
+        "--post_process",
+        action="store_true",
+        default=True,
+        help="Apply spatial post-processing to refine predictions",
+    )
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=7,
+        help="Window size for spatial context refinement (odd number)",
+    )
+
 
     # Input/output paths
     parser.add_argument(
@@ -824,7 +1157,8 @@ def create_prediction_visualization(prediction_path, ground_truth_path, output_d
     cm = confusion_matrix(
         ground_truth[valid_mask].flatten(),
         prediction[valid_mask].flatten(),
-        labels=unique_values
+        labels=unique_values,
+        normalize='true'
     )
     
     # Plot confusion matrix
@@ -833,7 +1167,7 @@ def create_prediction_visualization(prediction_path, ground_truth_path, output_d
         confusion_matrix=cm,
         display_labels=[f"{val}" for val in unique_values]
     )
-    disp.plot(cmap="Blues", values_format="d")
+    disp.plot(cmap="Blues", values_format=".2f")
     plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.savefig(output_confusion_path, dpi=200)
@@ -894,7 +1228,7 @@ def main():
     args = parse_args()
     
     print("\n" + "=" * 80)
-    print("Sentinel-2 Land Cover Classification Prediction".center(80))
+    print("Enhanced Sentinel-2 Land Cover Classification".center(80))
     print("=" * 80 + "\n")
     
     # Create output directory
@@ -926,9 +1260,9 @@ def main():
     with rasterio.open(args.ground_truth) as src:
         ground_truth = src.read(1)
         
-    # Step 5: Making memory-efficient predictions
-    print("\nStep 5: Making memory-efficient predictions...")
-    prediction_map, profile, co_occurrence, gt_unique = predict_patches(
+    # Step 5: Making improved memory-efficient predictions
+    print("\nStep 5: Making improved memory-efficient predictions...")
+    prediction_map, profile, co_occurrence, gt_unique = predict_patches_improved(
         model,
         processed_data["multiband_path"],
         ground_truth,
@@ -946,45 +1280,34 @@ def main():
         num_classes=model.final_conv.out_channels
     )
 
-    
-    ## Step 4: Make predictions
-    #print("\nStep 4: Making predictions...")
-    #prediction_map, profile, prediction_probs = predict_patches(
-    #    model,
-    #    processed_data["multiband_path"],
-    #    normalizer,
-    #    args.patch_size,
-    #    args.overlap,
-    #    args.batch_size,
-    #    return_probs=True  # Add this parameter to return probabilities
-    #)
-    #
-    ## Step 5: Reading ground truth for analysis...
-    #print("\nStep 5: Reading ground truth for analysis...")
-    #with rasterio.open(args.ground_truth) as src:
-    #    ground_truth = src.read(1)
-#
-    # Apply refined mapping
-    #refined_mapping = create_refined_mapping(
-    #    prediction_map,  # Use the raw prediction map before any remapping
-    #    ground_truth, 
-    #    num_classes=model.final_conv.out_channels  # Or the appropriate number of classes
-    #)
-
-    if refined_mapping:
-        print(f"\nUsing refined mapping with {len(refined_mapping)} classes")
-        remapped_prediction = remap_prediction(prediction_map, refined_mapping)
+    # Step 7: Apply post-processing if requested
+    if args.post_process:
+        print("\nStep 7: Applying advanced spatial post-processing...")
+        final_prediction = post_process_prediction(
+            prediction_map,
+            refined_mapping,
+            window_size=args.window_size,
+            ground_truth_info=processed_data["ground_truth_info"]
+        )
     else:
-        print("\nUsing original inverse mapping")
-        if inverse_mapping:
-            remapped_prediction = remap_prediction(prediction_map, inverse_mapping)
+        print("\nStep 7: Applying basic remapping without spatial post-processing...")
+        if refined_mapping:
+            print(f"Using refined mapping with {len(refined_mapping)} classes")
+            final_prediction = remap_prediction(prediction_map, refined_mapping)
         else:
-            remapped_prediction = prediction_map
-            
-    # Step 6: Save prediction
-    print("\nStep 6: Saving prediction results...")
+            print("Using original inverse mapping")
+            if inverse_mapping:
+                final_prediction = remap_prediction(prediction_map, inverse_mapping)
+            else:
+                final_prediction = prediction_map
+    
+    # Step 8: Save prediction
+    print("\nStep 8: Saving prediction results...")
     prediction_path = os.path.join(args.output_dir, "prediction.tif")
-    save_prediction(remapped_prediction, profile, prediction_path)
+    save_prediction(final_prediction, profile, prediction_path)
+    
+    # The rest of your code remains the same...
+    # [Keep your existing code for metrics calculation and visualization]
     
     # Step 7: Calculate metrics and visualize
     print("\nStep 7: Evaluating and visualizing results...")
@@ -994,7 +1317,7 @@ def main():
         ground_truth = src.read(1)
     
     # Calculate metrics
-    metrics = calculate_metrics(remapped_prediction, ground_truth)
+    metrics = calculate_metrics(final_prediction, ground_truth)
     
     # Save metrics to JSON
     metrics_path = os.path.join(args.output_dir, "metrics.json")
@@ -1007,7 +1330,7 @@ def main():
         if inverse_mapping:
             class_values = sorted(list(map(int, inverse_mapping.values())))
         else:
-            class_values = sorted(list(np.unique(remapped_prediction)))
+            class_values = sorted(list(np.unique(final_prediction)))
         
         # Create visualizations
         vis_paths = create_prediction_visualization(

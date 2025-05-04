@@ -188,7 +188,7 @@ class SegmentationMetrics:
         else:
             # Multiclass segmentation metrics
             self.iou_score = MeanIoU(num_classes=num_classes).to(device)
-            self.dice_score = DiceScore(num_classes=num_classes).to(device)
+            self.dice_score = CorrectDiceMetric(num_classes=num_classes).to(device)
             self.f1_score = MulticlassF1Score(
                 num_classes=num_classes, average="macro"
             ).to(device)

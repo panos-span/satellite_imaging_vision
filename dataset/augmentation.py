@@ -122,7 +122,7 @@ def get_train_transform(p=0.5, patch_size=256, use_copy_paste=False, object_clas
     return transform
 
 
-def get_val_transform(patch_size=256):
+def get_val_transform(patch_size=128):
     """
     Get memory-efficient validation transforms.
     """

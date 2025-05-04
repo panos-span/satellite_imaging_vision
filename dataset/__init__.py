@@ -6,7 +6,7 @@ and normalization for Sentinel-2 multispectral imagery in land cover classificat
 """
 from .data_loader import SentinelDataset, create_data_loaders
 from .patch_dataset import SentinelPatchDataset, create_patch_data_loaders
-from .dataset_splitter import create_stratified_sample_indices, create_patch_based_splits
+from .dataset_splitter import create_stratified_sample_indices
 from .augmentation import (
     get_train_transform,
     get_val_transform,

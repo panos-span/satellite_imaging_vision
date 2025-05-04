@@ -173,10 +173,10 @@ def create_patch_data_loaders(
     batch_size=4,
     train_transform=None,
     val_transform=None,
-    num_workers=4,
+    num_workers=os.cpu_count(),
     use_rare_class_sampler=True,
     use_improved_sampler=True,  # Added parameter to choose between samplers
-    oversample_factor=10,
+    oversample_factor=3,
 ):
     """
     Create DataLoaders for patch-based datasets with improved class balancing.
@@ -274,7 +274,7 @@ def create_patch_data_loaders(
                 train_dataset,
                 class_counts,
                 min_factor=1,
-                max_factor=10,
+                max_factor=6,
                 precomputed_rare_indices=rare_class_indices
             )
             print("Using ImprovedRareClassSampler for better class balance")

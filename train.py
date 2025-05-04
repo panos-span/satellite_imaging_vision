@@ -14,11 +14,10 @@ This script implements a complete training pipeline with:
 import argparse
 import json
 import os
+import pickle
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -29,29 +28,83 @@ from dataset.class_remapper import create_class_remapper
 from dataset.mask_handler import clean_mask, inspect_dataset_masks
 from dataset.metrics import (
     CombinedCEDiceLoss,
-    calculate_balanced_alpha,
     calculate_sqrt_inverse_weights,
     create_metrics,
 )
-from dataset.normalizers import load_sentinel2_normalizer, normalize_batch
-from dataset.patch_dataset import create_patch_data_loaders
+from dataset.normalizers import load_sentinel2_normalizer, normalize_batch,  Sentinel2Normalizer
+from dataset.patch_dataset import create_patch_data_loaders, calculate_class_pixel_counts, SentinelPatchDataset
 from dataset.utils import detect_classes_from_dataset
 from models.unet import UNet
 
-torch.backends.cudnn.benchmark = True
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
+"""
+python run_experiment.py --data_dir F:\processed_data\training_dataset_128 --encoder_type best_performance --use_normalizer --batch_size 16 --num_epochs 5 --early_stopping 2 --save_dir F:\processed_data\model_experiments_special --wandb_project sentinel2_landcover --patch_size 128 --use_copy_paste --custom_experiment --experiment_config experiments_config.json --use_improved_sampler --use_copy_paste --num_workers 8
+"""
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# python train.py --data_dir "F:\\output\remapped_dataset"
-#    --save_dir "F:\\output\model_results\stable"
-#    --model_name unet_sentinel2_stable
-#    --encoder_type best_performance
-#    --freeze_backbone
-#    --encoder_lr_factor 0.1
-#    --learning_rate 5e-4
-#    --scheduler onecycle
-#    --use_amp
+# In train.py, modify the data loading section:
+
+def get_data_loaders(data_dir, batch_size=8, num_workers=4):
+    """Create data loaders that respect stratified splits"""
+    
+    # Check if stratified split info exists
+    split_info_path = os.path.join(data_dir, 'split_info.json')
+    if os.path.exists(split_info_path):
+        print("Loading stratified split information...")
+        with open(split_info_path, 'r') as f:
+            split_info = json.load(f)
+            
+        # Create datasets from the stratified splits
+        train_dir = os.path.join(data_dir, 'train')
+        val_dir = os.path.join(data_dir, 'val')
+        test_dir = os.path.join(data_dir, 'test')
+        
+        # Create transforms
+        train_transform = get_train_transform(p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste)
+        val_transform = get_val_transform(patch_size=args.patch_size)
+        
+        # Create datasets using the existing directory structure
+        train_dataset = SentinelPatchDataset(train_dir, transform=train_transform)
+        val_dataset = SentinelPatchDataset(val_dir, transform=val_transform)
+        test_dataset = SentinelPatchDataset(test_dir, transform=val_transform)
+        
+        # Print class distribution information
+        print("\nClass distribution after stratified split:")
+        for split, dist in split_info.get('class_distribution', {}).items():
+            print(f"  {split}: {dist}")
+    else:
+        # Fall back to non-stratified loading
+        print("No stratified split information found. Using regular dataset loading.")
+        return create_patch_data_loaders(
+            patches_dir=data_dir,
+            batch_size=batch_size,
+            train_transform=get_train_transform(p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste),
+            val_transform=get_val_transform(patch_size=args.patch_size),
+            num_workers=num_workers
+        )
+    
+    # Create and return data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                             num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                           num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                            num_workers=num_workers, pin_memory=True)
+    
+    print(f"Created data loaders with:")
+    print(f"  {len(train_dataset)} training samples")
+    print(f"  {len(val_dataset)} validation samples")
+    print(f"  {len(test_dataset)} test samples")
+    
+    return {
+        'train': train_loader,
+        'val': val_loader,
+        'test': test_loader
+    }
 
 
 def create_optimizer_with_differential_lr(
@@ -204,7 +257,7 @@ def train_epoch(
 
             # Mixed precision forward pass
             if use_amp and scaler is not None:
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with autocast(device_type="cuda", dtype=torch.float32):
                     # Forward pass
                     outputs = model(images)
                     loss = criterion(outputs, masks)
@@ -290,7 +343,7 @@ def validate(
 
                 # Mixed precision inference
                 if use_amp:
-                    with autocast(device_type="cuda"):
+                    with autocast(device_type="cuda", dtype=torch.float32):
                         outputs = model(images)
                         loss = criterion(outputs, masks)
                 else:
@@ -598,115 +651,142 @@ def train_model(
     return history, best_epoch
 
 
-def run_hyperparameter_experiment(args, experiment_configs=None):
-    def calculate_class_pixel_counts(dataset, num_samples=500):
-        """
-        Calculate class distribution from dataset for loss weighting.
+def setup_data_and_preprocessing(args):
+    """
+    Setup data loaders and preprocessing components.
+    
+    Parameters:
+    -----------
+    args : argparse.Namespace
+        Command line arguments
         
-        Parameters:
-        -----------
-        dataset : torch.utils.data.Dataset
-            Dataset to analyze
-        num_samples : int
-            Number of samples to analyze for efficiency
-        
-        Returns:
-        --------
-        dict, int
-            Dictionary with class counts and total pixels analyzed
-        """
-        # Limit samples for efficiency
-        num_samples = min(num_samples, len(dataset))
-        indices = np.random.choice(len(dataset), num_samples, replace=False)
-        
-        # Initialize counts
-        class_counts = {}
-        total_pixels = 0
-        
-        # Process samples
-        for i in tqdm(indices, desc="Analyzing class distribution"):
-            _, mask = dataset[i]
-            
-            # Convert to numpy if needed
-            if isinstance(mask, torch.Tensor):
-                mask_np = mask.numpy()
-            else:
-                mask_np = mask
-            
-            # Count total valid pixels
-            total_pixels += mask_np.size
-            
-            # Count per class
-            unique_values, counts = np.unique(mask_np, return_counts=True)
-            for cls, count in zip(unique_values, counts):
-                cls_int = int(cls)
-                if cls_int not in class_counts:
-                    class_counts[cls_int] = 0
-                class_counts[cls_int] += int(count)
-        
-        return class_counts, total_pixels
-
-    """Run multiple training experiments with different hyperparameters."""
-    # Create experiment directory
-    experiment_dir = os.path.join(args.save_dir, "experiments")
-    os.makedirs(experiment_dir, exist_ok=True)
-
-    # Get data loaders
+    Returns:
+    --------
+    dict
+        Dictionary containing data loaders, normalizer, class remapper, and other setup info
+    """
+    # Setup data augmentation
     train_transform = get_train_transform(
         p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
-
-    # Load normalizer if requested and available - IMPORTANT FIX
+    
+    # Load or create normalizer
     normalizer = None
-    if getattr(args, "use_normalizer", True):  # Default to True if not specified
+    if args.use_normalizer:
         normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
         if os.path.exists(normalizer_path):
             print(f"Loading Sentinel-2 normalizer from {normalizer_path}")
             try:
                 normalizer = load_sentinel2_normalizer(normalizer_path)
                 print(f"Loaded normalizer with method: {normalizer.method}")
+                
+                # Verify normalizer is properly configured
+                if not normalizer.is_fitted or normalizer.band_means is None:
+                    print("Normalizer missing band statistics. Fitting on dataset...")
+                    normalizer.fit(args.data_dir)
+                    
+                    # Save updated normalizer
+                    with open(normalizer_path, "wb") as f:
+                        pickle.dump(normalizer, f)
+                    print("Saved updated normalizer with band-specific statistics")
             except Exception as e:
                 print(f"Error loading normalizer: {e}")
-                print("Will apply default normalization during training")
+                print("Creating new band-specific normalizer")
+                normalizer = Sentinel2Normalizer(method="band_specific")
+                normalizer.fit(args.data_dir)
+                
+                # Save new normalizer
+                with open(normalizer_path, "wb") as f:
+                    pickle.dump(normalizer, f)
         else:
-            print(f"Warning: Normalizer not found at {normalizer_path}")
-            print("Will apply default normalization during training")
+            print("Creating new band-specific normalizer...")
+            normalizer = Sentinel2Normalizer(method="band_specific")
+            normalizer.fit(args.data_dir)
+            
+            # Save new normalizer
+            with open(normalizer_path, "wb") as f:
+                pickle.dump(normalizer, f)
 
-    # In main() and run_hyperparameter_experiment()
+    # Create data loaders with optimized settings
     data_loaders = create_patch_data_loaders(
         patches_dir=args.data_dir,
         batch_size=args.batch_size,
         train_transform=train_transform,
         val_transform=val_transform,
         num_workers=args.num_workers,
-        use_rare_class_sampler=True,  # Always use a sampler
-        use_improved_sampler=args.use_improved_sampler,  # Choose which sampler to use
+        use_rare_class_sampler=True,
+        use_improved_sampler=args.use_improved_sampler,
     )
 
-    # Inspect dataset masks to detect issues - ADDED FROM MAIN
+    print(f"Training on {len(data_loaders['train'].dataset)} samples")
+    print(f"Validating on {len(data_loaders['val'].dataset)} samples")
+
+    # Inspect dataset masks (using reduced sample size for efficiency)
     print("\nInspecting dataset for mask issues...")
     train_inspection = inspect_dataset_masks(
-        data_loaders["train"].dataset, num_samples=500
+        data_loaders['train'].dataset, 
+        num_samples=min(50, len(data_loaders['train'].dataset))
     )
 
-    # Initialize class remapper if sparse indices detected - ADDED FROM MAIN
+    # Initialize class remapper if needed
     class_remapper = None
+    remapper_cache_path = os.path.join(args.data_dir, "remapper_cache.pkl")
+    
     if train_inspection.get("sparse_indices", False):
-        print("\nDetected sparse class indices. Creating class remapper...")
-        class_remapper = create_class_remapper(
-            data_loaders["train"].dataset, num_samples=500
-        )
+        print("\nDetected sparse class indices. Looking for cached remapper first...")
+        if os.path.exists(remapper_cache_path):
+            try:
+                with open(remapper_cache_path, 'rb') as f:
+                    class_remapper = pickle.load(f)
+                print("Loaded class remapper from cache")
+            except Exception:
+                print("Failed to load cached remapper, creating new one")
+                class_remapper = create_class_remapper(
+                    data_loaders["train"].dataset, num_samples=100
+                )
+                # Cache the remapper
+                with open(remapper_cache_path, 'wb') as f:
+                    pickle.dump(class_remapper, f)
+        else:
+            print("Creating class remapper and caching for future use...")
+            class_remapper = create_class_remapper(
+                data_loaders["train"].dataset, num_samples=100
+            )
+            # Cache the remapper
+            with open(remapper_cache_path, 'wb') as f:
+                pickle.dump(class_remapper, f)
 
         # Update number of classes based on remapped classes
         args.num_classes = class_remapper.num_classes
         print(f"Using {args.num_classes} classes after remapping")
-    # Auto-detect classes if not specified
+        
+    # Auto-detect classes if needed
     elif args.auto_detect_classes or args.num_classes is None:
         print("Auto-detecting classes from dataset...")
-        class_info = detect_classes_from_dataset(
-            data_loaders["train"].dataset, sample_size=100
-        )
+        # Check for cached class info
+        class_info_path = os.path.join(args.data_dir, "class_info_cache.json")
+        if os.path.exists(class_info_path):
+            try:
+                with open(class_info_path, 'r') as f:
+                    class_info = json.load(f)
+                print("Loaded class info from cache")
+            except Exception:
+                print("Failed to load cached class info, detecting classes...")
+                class_info = detect_classes_from_dataset(
+                    data_loaders["train"].dataset, sample_size=100
+                )
+                # Cache the class info
+                with open(class_info_path, 'w') as f:
+                    json.dump(class_info, f)
+        else:
+            class_info = detect_classes_from_dataset(
+                data_loaders["train"].dataset, sample_size=100
+            )
+            # Cache the class info
+            with open(class_info_path, 'w') as f:
+                json.dump(class_info, f)
+                
         detected_num_classes = class_info["num_classes"]
 
         # Check if auto-detected classes match with inspection results
@@ -724,6 +804,283 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             args.num_classes = detected_num_classes
 
         print(f"Auto-detected {args.num_classes} classes")
+    
+    return {
+        "data_loaders": data_loaders,
+        "normalizer": normalizer,
+        "class_remapper": class_remapper,
+        "train_inspection": train_inspection
+    }
+
+
+def compute_class_weights(dataset, num_classes, cache_dir=None, sample_size=500):
+    """
+    Compute class weights based on class distribution for loss weighting.
+    
+    Parameters:
+    -----------
+    dataset : torch.utils.data.Dataset
+        Dataset to analyze
+    num_classes : int
+        Number of classes
+    cache_dir : str or None
+        Directory to cache weights
+    sample_size : int
+        Number of samples to analyze
+        
+    Returns:
+    --------
+    torch.Tensor
+        Class weights tensor
+    """
+    cache_path = None
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "class_weights_cache.pt")
+        
+    # Try to load cached weights
+    if cache_path and os.path.exists(cache_path):
+        try:
+            class_weights = torch.load(cache_path)
+            print("Loaded cached class weights")
+            return class_weights
+        except Exception:
+            print("Failed to load cached weights, computing new ones...")
+    
+    # Calculate class distribution
+    print("Calculating class distribution for loss weighting...")
+    class_counts, total_pixels = calculate_class_pixel_counts(dataset, num_samples=sample_size)
+    
+    # Display class distribution
+    print(f"Total pixels analyzed: {total_pixels}")
+    for cls, count in sorted(class_counts.items()):
+        print(f"  Class {cls}: {count:,} pixels ({count/total_pixels*100:.2f}%)")
+    
+    # Calculate sqrt-inverse class weights
+    class_weights = calculate_sqrt_inverse_weights(class_counts)
+    class_weights = class_weights.to(device)
+    print(f"Class weights: {class_weights}")
+    
+    # Cache weights if path provided
+    if cache_path:
+        torch.save(class_weights, cache_path)
+        
+    return class_weights
+
+
+def setup_model_and_training(args, config=None, data_loaders=None, class_remapper=None):
+    """
+    Setup model, optimizer, scheduler, and loss function based on config.
+    
+    Parameters:
+    -----------
+    args : argparse.Namespace
+        Command line arguments
+    config : dict or None
+        Hyperparameter configuration (for experiments)
+    data_loaders : dict or None
+        Data loaders dict containing 'train' and 'val'
+    class_remapper : ClassRemapper or None
+        Class remapper object if used
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing model, criterion, optimizer, scheduler, and other config
+    """
+    # Use config values if provided, otherwise use args
+    if config is None:
+        config = {
+            "learning_rate": args.learning_rate,
+            "encoder_lr_factor": args.encoder_lr_factor,
+            "weight_decay": args.weight_decay,
+            "optimizer": args.optimizer,
+            "scheduler": args.scheduler,
+            "freeze_backbone": getattr(args, "freeze_backbone", True),
+            "progressive_unfreeze": getattr(args, "progressive_unfreeze", False),
+        }
+    
+    # Create model
+    print(f"Creating U-Net model with {args.num_classes} output classes...")
+    model = UNet(
+        in_channels=args.in_channels,
+        num_classes=args.num_classes,
+        encoder_type=args.encoder_type,
+        use_batchnorm=args.use_batchnorm,
+        skip_connections=args.skip_connections,
+        freeze_backbone=config.get("freeze_backbone", True),
+    ).to(device)
+    
+    # Compute class weights for loss function
+    class_weights = compute_class_weights(
+        dataset=data_loaders["train"].dataset if data_loaders else None,
+        num_classes=args.num_classes,
+        cache_dir=args.data_dir,
+        sample_size=500
+    )
+    
+    # Create loss function
+    ce_weight = 0.5  # Default to balanced weights
+    dice_weight = 0.5
+    if hasattr(args, "ce_weight") and hasattr(args, "dice_weight"):
+        ce_weight = args.ce_weight
+        dice_weight = args.dice_weight
+        
+    criterion = CombinedCEDiceLoss(
+        weights=class_weights,
+        num_classes=args.num_classes,
+        ce_weight=ce_weight,
+        dice_weight=dice_weight
+    )
+    print(f"Using combined CE+Dice loss (CE: {ce_weight}, Dice: {dice_weight}) with class weights")
+    
+    # Create optimizer
+    optimizer = create_optimizer_with_differential_lr(
+        model=model,
+        base_lr=config["learning_rate"],
+        encoder_lr_factor=config.get("encoder_lr_factor", 0.1),
+        weight_decay=config.get("weight_decay", 1e-4),
+        optimizer_type=config.get("optimizer", "adam"),
+    )
+    
+    # Create scheduler
+    scheduler = None
+    scheduler_type = config.get("scheduler", "onecycle")
+    
+    if scheduler_type == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=args.num_epochs, 
+            eta_min=getattr(args, "min_lr", 1e-6)
+        )
+    elif scheduler_type == "step":
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, 
+            step_size=getattr(args, "step_size", 10), 
+            gamma=getattr(args, "gamma", 0.1)
+        )
+    elif scheduler_type == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode="min", 
+            factor=getattr(args, "factor", 0.1), 
+            patience=getattr(args, "patience", 5)
+        )
+    elif scheduler_type == "onecycle":
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[
+                config["learning_rate"] * config.get("encoder_lr_factor", 0.1),
+                config["learning_rate"],
+                config["learning_rate"],
+            ],
+            total_steps=args.num_epochs * len(data_loaders["train"]) if data_loaders else None,
+            pct_start=0.3,
+        )
+    
+    # Create progressive unfreezing schedule if requested
+    unfreeze_schedule = None
+    if config.get("progressive_unfreeze", False):
+        # Define unfreeze schedule based on total epochs
+        total_epochs = args.num_epochs
+        unfreeze_schedule = {
+            int(total_epochs * 0.3): "layer4",  # Unfreeze at 30% of training
+            int(total_epochs * 0.5): "layer3",  # Unfreeze at 50% of training
+            int(total_epochs * 0.7): "layer2",  # Unfreeze at 70% of training
+            int(total_epochs * 0.9): "layer1",  # Unfreeze at 90% of training
+        }
+        print(f"Progressive unfreezing schedule: {unfreeze_schedule}")
+    
+    return {
+        "model": model,
+        "criterion": criterion,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "unfreeze_schedule": unfreeze_schedule,
+        "config": config
+    }
+
+
+def init_wandb(args, class_remapper=None, train_inspection=None, config=None):
+    """
+    Initialize Weights & Biases with optimized settings.
+    
+    Parameters:
+    -----------
+    args : argparse.Namespace
+        Command line arguments
+    class_remapper : ClassRemapper or None
+        Class remapper object if used
+    train_inspection : dict or None
+        Dataset inspection results
+    config : dict or None
+        Custom configuration dict
+        
+    Returns:
+    --------
+    dict
+        Configuration dictionary
+    """
+    if not args.wandb_project:
+        return None
+        
+    print(f"Initializing Weights & Biases project with optimized settings: {args.wandb_project}")
+    
+    if config is None:
+        config = {
+            "in_channels": args.in_channels,
+            "num_classes": args.num_classes,
+            "encoder_type": args.encoder_type,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "encoder_lr_factor": args.encoder_lr_factor,
+            "optimizer": args.optimizer,
+            "weight_decay": args.weight_decay,
+            "scheduler": args.scheduler,
+            "num_epochs": args.num_epochs,
+            "dataset": os.path.basename(args.data_dir),
+            "use_amp": getattr(args, "use_amp", True),
+            "freeze_backbone": getattr(args, "freeze_backbone", True),
+            "progressive_unfreeze": getattr(args, "progressive_unfreeze", False),
+        }
+
+    # Add class remapping info if used
+    if class_remapper is not None:
+        config["using_class_remapper"] = True
+        config["original_class_values"] = sorted(
+            list(class_remapper.class_mapping.keys())
+        )
+        config["num_original_classes"] = len(class_remapper.class_mapping)
+
+    # Initialize with optimized settings
+    os.environ["WANDB_CONSOLE"] = "off"  # Reduce console output
+    wandb.init(
+        project=args.wandb_project, 
+        config=config,
+        # Lower log frequency to reduce overhead
+        settings=wandb.Settings(log_internal=60)  # Log internals every 60 seconds
+    )
+    
+    # Log dataset info
+    if train_inspection:
+        wandb.run.summary["sparse_indices"] = train_inspection.get("sparse_indices", False)
+        wandb.run.summary["num_classes"] = args.num_classes
+    
+    return config
+
+
+def run_hyperparameter_experiment(args, experiment_configs=None):
+    """Run multiple training experiments with different hyperparameters."""
+    # Create experiment directory
+    experiment_dir = os.path.join(args.save_dir, "experiments")
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    # Setup data and preprocessing
+    setup_data = setup_data_and_preprocessing(args)
+    data_loaders = setup_data["data_loaders"]
+    normalizer = setup_data["normalizer"]
+    class_remapper = setup_data["class_remapper"]
+    train_inspection = setup_data["train_inspection"]
 
     # Define default hyperparameter configurations if not provided
     if experiment_configs is None:
@@ -783,109 +1140,38 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
 
     # Store results
     results = []
-
-    # Initialize wandb sweep if it's being used
+    
+    # Initialize wandb
     wandb_project = getattr(args, "wandb_project", None)
+
+    # Pre-compute class weights once
+    class_weights = compute_class_weights(
+        dataset=data_loaders["train"].dataset,
+        num_classes=args.num_classes,
+        cache_dir=args.data_dir
+    )
 
     # Loop through hyperparameter combinations
     for i, config in enumerate(experiment_configs):
         print(f"\n{'='*80}")
         print(f"Experiment {i+1}/{len(experiment_configs)}: {config['name']}")
         print(f"{'='*80}\n")
-
-        # Create model
-        model = UNet(
-            in_channels=args.in_channels,
-            num_classes=args.num_classes,
-            encoder_type=args.encoder_type,
-            use_batchnorm=args.use_batchnorm,
-            skip_connections=args.skip_connections,
-            freeze_backbone=config.get("freeze_backbone", True),
-        ).to(device)
-
-        # Create optimizer with differential learning rates
-        optimizer = create_optimizer_with_differential_lr(
-            model=model,
-            base_lr=config["learning_rate"],
-            encoder_lr_factor=config.get("encoder_lr_factor", 0.1),
-            weight_decay=config.get("weight_decay", 1e-4),
-            optimizer_type=config.get("optimizer", "adam"),
+        
+        # Setup model and training components with this config
+        training_setup = setup_model_and_training(
+            args=args,
+            config=config,
+            data_loaders=data_loaders,
+            class_remapper=class_remapper
         )
         
-        # Calculate class weights for loss function
-        print("Calculating class distribution for loss weighting...")
-        class_counts, total_pixels = calculate_class_pixel_counts(data_loaders["train"].dataset, num_samples=500)
-        print(f"Total pixels analyzed: {total_pixels}")
+        model = training_setup["model"]
+        criterion = training_setup["criterion"]
+        optimizer = training_setup["optimizer"]
+        scheduler = training_setup["scheduler"]
+        unfreeze_schedule = training_setup["unfreeze_schedule"]
 
-        for cls, count in sorted(class_counts.items()):
-            print(f"  Class {cls}: {count:,} pixels ({count/total_pixels*100:.2f}%)")
-
-        # Calculate sqrt-inverse class weights
-        class_weights = calculate_sqrt_inverse_weights(class_counts)
-        class_weights = class_weights.to(device)
-        print(f"Class weights: {class_weights}")
-
-        # Create the combined loss function with class weights
-        criterion = CombinedCEDiceLoss(
-            weights=class_weights,
-            num_classes=args.num_classes,
-            ce_weight=0.7,  # Adjust as needed
-            dice_weight=0.3  # Adjust as needed
-        )
-        
-        print("Using combined CE+Dice loss with class weights")
-
-
-
-        # Create scheduler
-        scheduler = None
-        if config.get("scheduler") == "cosine":
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.num_epochs, eta_min=config.get("min_lr", 1e-6)
-            )
-        elif config.get("scheduler") == "step":
-            scheduler = optim.lr_scheduler.StepLR(
-                optimizer,
-                step_size=config.get("step_size", 10),
-                gamma=config.get("gamma", 0.1),
-            )
-        elif config.get("scheduler") == "plateau":
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=config.get("factor", 0.1),
-                patience=config.get("patience", 5),
-            )
-        elif config.get("scheduler") == "onecycle":
-            scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=[
-                    config["learning_rate"] * config.get("encoder_lr_factor", 0.1),
-                    config["learning_rate"],
-                    config["learning_rate"],
-                ],
-                total_steps=args.num_epochs * len(data_loaders["train"]),
-                pct_start=0.3,
-            )
-
-        # Create progressive unfreezing schedule if requested
-        unfreeze_schedule = None
-        if config.get("progressive_unfreeze", False):
-            # Define unfreeze schedule based on total epochs
-            total_epochs = args.num_epochs
-            unfreeze_schedule = {
-                int(total_epochs * 0.3): "layer4",  # Unfreeze at 30% of training
-                int(total_epochs * 0.5): "layer3",  # Unfreeze at 50% of training
-                int(total_epochs * 0.7): "layer2",  # Unfreeze at 70% of training
-                int(total_epochs * 0.9): "layer1",  # Unfreeze at 90% of training
-            }
-            print(f"Progressive unfreezing schedule: {unfreeze_schedule}")
-
-        # Save directory for this experiment
-        exp_save_dir = os.path.join(experiment_dir, config["name"])
-        os.makedirs(exp_save_dir, exist_ok=True)
-
-        # Prepare wandb config
+        # Create experiment-specific wandb config
         wandb_config = {
             **config,
             "in_channels": args.in_channels,
@@ -898,7 +1184,11 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             "experiment": config["name"],
         }
 
-        # Train model - IMPORTANT FIX: ADDED NORMALIZER
+        # Save directory for this experiment
+        exp_save_dir = os.path.join(experiment_dir, config["name"])
+        os.makedirs(exp_save_dir, exist_ok=True)
+
+        # Train model with this configuration
         print(f"Training with config: {config}")
         history, best_epoch = train_model(
             model,
@@ -918,7 +1208,7 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             remapper=class_remapper,
             use_amp=getattr(args, "use_amp", True),
             unfreeze_schedule=unfreeze_schedule,
-            normalizer=normalizer,  # This is the key fix
+            normalizer=normalizer,
         )
 
         # Plot learning curves
@@ -1037,182 +1327,23 @@ def main(args):
     print(f"Using device: {device}")
 
     # Optimize CPU thread settings for faster data loading
-    if args.num_workers == 0:
+    if args.num_workers < 12:
         args.num_workers = min(8, os.cpu_count())
         print(f"Setting num_workers to {args.num_workers} for better performance")
 
-    # Create simplified transforms - reduce expensive augmentations
-    print("Loading data with optimized transformations...")
-    train_transform = get_train_transform(
-        p=0.5, 
-        patch_size=args.patch_size, 
-        use_copy_paste=args.use_copy_paste,
-        # Keep copy-paste but reduce probability of expensive transforms
-        # This will be applied in the get_train_transform function
-    )
-    val_transform = get_val_transform(patch_size=args.patch_size)
+    # Setup data and preprocessing - unified function
+    setup_data = setup_data_and_preprocessing(args)
+    data_loaders = setup_data["data_loaders"]
+    normalizer = setup_data["normalizer"]
+    class_remapper = setup_data["class_remapper"]
+    train_inspection = setup_data["train_inspection"]
 
-    # Load normalizer
-    normalizer = None
-    if args.use_normalizer:
-        normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
-        if os.path.exists(normalizer_path):
-            print(f"Loading Sentinel-2 normalizer from {normalizer_path}")
-            try:
-                normalizer = load_sentinel2_normalizer(normalizer_path)
-                print(f"Loaded normalizer with method: {normalizer.method}")
-            except Exception as e:
-                print(f"Error loading normalizer: {e}")
-                print("Will apply default normalization during training")
-        else:
-            print(f"Warning: Normalizer not found at {normalizer_path}")
-            print("Will apply default normalization during training")
-
-    # Create data loaders with optimized settings
-    data_loaders = create_patch_data_loaders(
-        patches_dir=args.data_dir,
-        batch_size=args.batch_size,
-        train_transform=train_transform,
-        val_transform=val_transform,
-        num_workers=args.num_workers,
-        use_rare_class_sampler=True,  # Keep the rare class sampler
-        use_improved_sampler=args.use_improved_sampler,
-        # Add optimized DataLoader settings
-        pin_memory=True,
-        persistent_workers=True
-    )
-
-    print(f"Training on {len(data_loaders['train'].dataset)} samples")
-    print(f"Validating on {len(data_loaders['val'].dataset)} samples")
-
-    # Reduce dataset inspection sample size for faster startup
-    print("\nInspecting dataset for mask issues (using reduced sample size)...")
-    train_inspection = inspect_dataset_masks(
-        data_loaders['train'].dataset, 
-        num_samples=min(50, len(data_loaders['train'].dataset))
-    )
-
-    # Use cached class remapper if available to speed up startup
-    class_remapper = None
-    remapper_cache_path = os.path.join(args.data_dir, "remapper_cache.pkl")
-    
-    if train_inspection.get("sparse_indices", False):
-        print("\nDetected sparse class indices. Looking for cached remapper first...")
-        if os.path.exists(remapper_cache_path):
-            try:
-                with open(remapper_cache_path, 'rb') as f:
-                    class_remapper = pickle.load(f)
-                print("Loaded class remapper from cache")
-            except Exception:
-                print("Failed to load cached remapper, creating new one")
-                class_remapper = create_class_remapper(
-                    data_loaders["train"].dataset, num_samples=100
-                )
-                # Cache the remapper
-                with open(remapper_cache_path, 'wb') as f:
-                    pickle.dump(class_remapper, f)
-        else:
-            print("Creating class remapper and caching for future use...")
-            class_remapper = create_class_remapper(
-                data_loaders["train"].dataset, num_samples=100
-            )
-            # Cache the remapper
-            with open(remapper_cache_path, 'wb') as f:
-                pickle.dump(class_remapper, f)
-
-        # Update number of classes based on remapped classes
-        args.num_classes = class_remapper.num_classes
-        print(f"Using {args.num_classes} classes after remapping")
-    # Auto-detect classes if needed
-    elif args.auto_detect_classes or args.num_classes is None:
-        print("Auto-detecting classes from dataset...")
-        # Check for cached class info
-        class_info_path = os.path.join(args.data_dir, "class_info_cache.json")
-        if os.path.exists(class_info_path):
-            try:
-                with open(class_info_path, 'r') as f:
-                    class_info = json.load(f)
-                print("Loaded class info from cache")
-            except Exception:
-                print("Failed to load cached class info, detecting classes...")
-                class_info = detect_classes_from_dataset(
-                    data_loaders["train"].dataset, sample_size=100
-                )
-                # Cache the class info
-                with open(class_info_path, 'w') as f:
-                    json.dump(class_info, f)
-        else:
-            class_info = detect_classes_from_dataset(
-                data_loaders["train"].dataset, sample_size=100
-            )
-            # Cache the class info
-            with open(class_info_path, 'w') as f:
-                json.dump(class_info, f)
-                
-        detected_num_classes = class_info["num_classes"]
-
-        # Check if auto-detected classes match with inspection results
-        if "recommended_num_classes" in train_inspection:
-            recommended = train_inspection["recommended_num_classes"]
-            if recommended > detected_num_classes:
-                print(
-                    f"WARNING: Inspection suggests {recommended} classes but auto-detection found {detected_num_classes}"
-                )
-                print(f"Using the larger value ({recommended}) to be safe")
-                args.num_classes = recommended
-            else:
-                args.num_classes = detected_num_classes
-        else:
-            args.num_classes = detected_num_classes
-
-        print(f"Auto-detected {args.num_classes} classes")
-
-    # Initialize wandb with reduced logging frequency to decrease overhead
+    # Initialize wandb if not in experiment mode
+    config = None
     if args.wandb_project and not args.run_experiment:
-        print(f"Initializing Weights & Biases project with optimized settings: {args.wandb_project}")
-        config = {
-            "in_channels": args.in_channels,
-            "num_classes": args.num_classes,
-            "encoder_type": args.encoder_type,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "encoder_lr_factor": args.encoder_lr_factor,
-            "optimizer": args.optimizer,
-            "weight_decay": args.weight_decay,
-            "scheduler": args.scheduler,
-            "num_epochs": args.num_epochs,
-            "dataset": os.path.basename(args.data_dir),
-            "use_amp": getattr(args, "use_amp", True),
-            "freeze_backbone": getattr(args, "freeze_backbone", True),
-            "progressive_unfreeze": getattr(args, "progressive_unfreeze", False),
-        }
+        config = init_wandb(args, class_remapper, train_inspection)
 
-        # Add class remapping info if used
-        if class_remapper is not None:
-            config["using_class_remapper"] = True
-            config["original_class_values"] = sorted(
-                list(class_remapper.class_mapping.keys())
-            )
-            config["num_original_classes"] = len(class_remapper.class_mapping)
-
-        # Initialize with optimized settings
-        os.environ["WANDB_CONSOLE"] = "off"  # Reduce console output
-        wandb.init(
-            project=args.wandb_project, 
-            config=config,
-            # Lower log frequency to reduce overhead
-            settings=wandb.Settings(log_internal=60)  # Log internals every 60 seconds
-        )
-
-    # Log dataset info to wandb
-    if args.wandb_project and wandb.run is not None:
-        wandb.run.summary["train_samples"] = len(data_loaders["train"].dataset)
-        wandb.run.summary["val_samples"] = len(data_loaders["val"].dataset)
-        # Only log essential inspection info
-        wandb.run.summary["sparse_indices"] = train_inspection.get("sparse_indices", False)
-        wandb.run.summary["num_classes"] = args.num_classes
-
-    # Run hyperparameter experiment if requested - with optimized settings
+    # Run hyperparameter experiment if requested
     if args.run_experiment:
         print("Running hyperparameter experiment with optimized settings...")
         best_config = run_hyperparameter_experiment(args)
@@ -1229,132 +1360,19 @@ def main(args):
 
         print(f"Using best hyperparameters for final training: {best_config}")
 
-    # Create model - use efficient variant if specified
-    print(f"Creating U-Net model with {args.num_classes} output classes...")
-    model = UNet(
-        in_channels=args.in_channels,
-        num_classes=args.num_classes,
-        encoder_type=args.encoder_type,
-        use_batchnorm=args.use_batchnorm,
-        skip_connections=args.skip_connections,
-        freeze_backbone=getattr(args, "freeze_backbone", True),
-    ).to(device)
-    
-    # If PyTorch 2.0+ is available, use torch.compile for faster training
-    if hasattr(torch, "compile") and torch.__version__ >= "2.0.0":
-        try:
-            print("Using torch.compile for faster training...")
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"Could not use torch.compile: {e}")
-
-    # Precompute class weights for faster startup
-    # Calculate class weights for loss function
-    class_counts = np.zeros(args.num_classes, dtype=np.int64)
-    sample_size = min(500, len(data_loaders["train"].dataset))
-    
-    # Try to load cached class weights
-    class_weights_cache = os.path.join(args.data_dir, "class_weights_cache.pt")
-    if os.path.exists(class_weights_cache):
-        try:
-            class_weights = torch.load(class_weights_cache)
-            print("Loaded cached class weights")
-        except Exception:
-            print("Computing class weights...")
-            # Calculate class weights from dataset samples
-            for i in range(sample_size):
-                _, mask = data_loaders["train"].dataset[i]
-                unique, counts = np.unique(mask.numpy(), return_counts=True)
-                for cls, cnt in zip(unique, counts):
-                    if 0 <= cls < args.num_classes:
-                        class_counts[cls] += cnt
-            
-            # Apply square root inverse frequency weighting
-            class_weights = calculate_sqrt_inverse_weights(
-                {i: int(count) for i, count in enumerate(class_counts)},
-                total_pixels=class_counts.sum()
-            )
-            # Cache weights
-            torch.save(class_weights, class_weights_cache)
-    else:
-        print("Computing class weights...")
-        # Calculate class weights from dataset samples
-        for i in range(sample_size):
-            _, mask = data_loaders["train"].dataset[i]
-            unique, counts = np.unique(mask.numpy(), return_counts=True)
-            for cls, cnt in zip(unique, counts):
-                if 0 <= cls < args.num_classes:
-                    class_counts[cls] += cnt
-        
-        # Apply square root inverse frequency weighting
-        class_weights = calculate_sqrt_inverse_weights(
-            {i: int(count) for i, count in enumerate(class_counts)},
-            total_pixels=class_counts.sum()
-        )
-        # Cache weights
-        torch.save(class_weights, class_weights_cache)
-    
-    class_weights = class_weights.to(device)
-    print(f"Class weights: {class_weights}")
-
-    # Create loss function with balanced CE and Dice components
-    criterion = CombinedCEDiceLoss(
-        weights=class_weights,
-        num_classes=args.num_classes,
-        ce_weight=0.5,  # Balanced CE and Dice weights
-        dice_weight=0.5  # Balanced CE and Dice weights
+    # Setup model and training components - unified function
+    training_setup = setup_model_and_training(
+        args=args,
+        data_loaders=data_loaders,
+        class_remapper=class_remapper
     )
-    print("Using combined CE+Dice loss with class weights")
-
-    # Create optimizer with differential learning rates
-    optimizer = create_optimizer_with_differential_lr(
-        model=model,
-        base_lr=args.learning_rate,
-        encoder_lr_factor=args.encoder_lr_factor,
-        weight_decay=args.weight_decay,
-        optimizer_type=args.optimizer,
-    )
-
-    # Create scheduler - use OneCycleLR by default for faster convergence
-    scheduler = None
-    if args.scheduler == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.num_epochs, eta_min=args.min_lr
-        )
-    elif args.scheduler == "step":
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=args.step_size, gamma=args.gamma
-        )
-    elif args.scheduler == "plateau":
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=args.factor, patience=args.patience
-        )
-    elif args.scheduler == "onecycle" or args.scheduler is None:
-        # Default to OneCycleLR for faster convergence
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=[
-                args.learning_rate * args.encoder_lr_factor,
-                args.learning_rate,
-                args.learning_rate,
-            ],
-            total_steps=args.num_epochs * len(data_loaders["train"]),
-            pct_start=0.3,
-        )
-
-    # Create progressive unfreezing schedule if requested
-    unfreeze_schedule = None
-    if getattr(args, "progressive_unfreeze", False):
-        # Define unfreeze schedule based on total epochs
-        total_epochs = args.num_epochs
-        unfreeze_schedule = {
-            int(total_epochs * 0.3): "layer4",  # Unfreeze at 30% of training
-            int(total_epochs * 0.5): "layer3",  # Unfreeze at 50% of training
-            int(total_epochs * 0.7): "layer2",  # Unfreeze at 70% of training
-            int(total_epochs * 0.9): "layer1",  # Unfreeze at 90% of training
-        }
-        print(f"Progressive unfreezing schedule: {unfreeze_schedule}")
-
+    
+    model = training_setup["model"]
+    criterion = training_setup["criterion"]
+    optimizer = training_setup["optimizer"]
+    scheduler = training_setup["scheduler"]
+    unfreeze_schedule = training_setup["unfreeze_schedule"]
+    
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -1373,7 +1391,7 @@ def main(args):
         model_name=args.model_name,
         early_stopping=args.early_stopping,
         wandb_project=args.wandb_project,
-        config=config if "config" in locals() else None,
+        config=config,
         num_classes=args.num_classes,
         remapper=class_remapper,
         use_amp=getattr(args, "use_amp", True),
@@ -1396,7 +1414,6 @@ def main(args):
         remapper_path = os.path.join(args.save_dir, f"{args.model_name}_remapper.json")
         class_remapper.save(remapper_path)
         print(f"Saved class remapper to {remapper_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -1440,7 +1457,7 @@ if __name__ == "__main__":
     )
 
     # Training parameters
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument(
         "--learning_rate", type=float, default=1e-3, help="Learning rate"
