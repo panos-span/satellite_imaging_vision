@@ -8,6 +8,7 @@ with improved handling for multiclass segmentation and edge cases.
 import torch
 import numpy as np
 from torchmetrics.segmentation import MeanIoU, DiceScore
+import torchmetrics
 from torchmetrics.classification import (
     BinaryF1Score,
     MulticlassF1Score,
@@ -17,6 +18,67 @@ from torchmetrics.classification import (
 
 import torch.nn as nn
 import torch.nn.functional as F
+
+class CorrectDiceMetric(torchmetrics.Metric):
+    def __init__(self, num_classes, ignore_index=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        
+        # Initialize accumulators for TP, FP, FN per class
+        self.add_state("true_positives", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+        self.add_state("false_positives", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+        self.add_state("false_negatives", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+    
+    def update(self, preds, targets):
+        """Update metric state with predictions and targets"""
+        # Handle logits vs predictions
+        if preds.dim() == 4 and preds.size(1) > 1:  # [B, C, H, W] format with logits
+            preds = torch.argmax(preds, dim=1)  # Convert to class indices
+        
+        # Process each class
+        for c in range(self.num_classes):
+            # Create binary masks
+            pred_mask = (preds == c)
+            target_mask = (targets == c)
+            
+            # Skip ignored indices
+            if self.ignore_index is not None:
+                valid_mask = (targets != self.ignore_index)
+                pred_mask = pred_mask & valid_mask
+                target_mask = target_mask & valid_mask
+            
+            # Calculate metrics components
+            self.true_positives[c] += (pred_mask & target_mask).sum().float()
+            self.false_positives[c] += (pred_mask & ~target_mask).sum().float()
+            self.false_negatives[c] += (~pred_mask & target_mask).sum().float()
+    
+    def compute(self):
+        """Compute Dice scores for all classes"""
+        # Formula: 2*TP / (2*TP + FP + FN)
+        numerator = 2 * self.true_positives
+        denominator = 2 * self.true_positives + self.false_positives + self.false_negatives
+        
+        # Handle division by zero (classes not present in batch)
+        dice_per_class = torch.zeros_like(numerator)
+        non_zero_indices = denominator > 0
+        dice_per_class[non_zero_indices] = numerator[non_zero_indices] / denominator[non_zero_indices]
+        
+        # For overall dice, only average classes that actually appear in the data
+        class_has_data = (self.true_positives + self.false_negatives) > 0
+        
+        if class_has_data.sum() > 0:
+            # Average only over classes that appear in the data
+            mean_dice = dice_per_class[class_has_data].mean()
+        else:
+            # Edge case - no class data
+            mean_dice = torch.tensor(0.0, device=dice_per_class.device)
+        
+        # Print diagnostics to help debug
+        print(f"Class dice values: {dice_per_class}")
+        print(f"Mean dice: {mean_dice}")
+        
+        return mean_dice
 
 
 class BalancedFocalLoss(nn.Module):
@@ -120,7 +182,7 @@ class SegmentationMetrics:
         if num_classes == 1:
             # Binary segmentation metrics
             self.iou_score = MeanIoU(num_classes=2).to(device)
-            self.dice_score = DiceScore(num_classes=2).to(device)
+            self.dice_score = CorrectDiceMetric(num_classes=num_classes),
             self.f1_score = BinaryF1Score(threshold=threshold).to(device)
             self.accuracy = BinaryAccuracy(threshold=threshold).to(device)
         else:
@@ -220,6 +282,11 @@ class SegmentationMetrics:
             # We should average them, not sum them
             if self.num_classes > 1:
                 dice_tensor = self.dice_score.compute()
+                # Check if dice values are in expected range
+                if torch.any(dice_tensor > 1.5):
+                    print(f"WARNING: Unusual dice values detected: {dice_tensor}")
+                    # Apply clipping if values are abnormal
+                    dice_tensor = torch.clamp(dice_tensor, 0.0, 1.0)
                 dice = torch.mean(dice_tensor).item()  # Average across classes
             else:
                 dice = self.dice_score.compute().item()
@@ -274,3 +341,110 @@ def create_metrics(num_classes=1, threshold=0.5, device=None):
         Metrics object for segmentation
     """
     return SegmentationMetrics(num_classes, threshold, device)
+
+class CombinedCEDiceLoss(nn.Module):
+    def __init__(self, weights=None, num_classes=9, ce_weight=0.7, dice_weight=0.3):
+        super().__init__()
+        self.ce_loss = nn.CrossEntropyLoss(weight=weights)
+        self.dice_weight = dice_weight
+        self.ce_weight = ce_weight
+        self.num_classes = num_classes
+        
+    def forward(self, inputs, targets):
+        # CE Loss
+        ce_loss = self.ce_loss(inputs, targets)
+        
+        # Dice Loss with per-sample calculation
+        inputs_soft = F.softmax(inputs, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        
+        # Initialize dice scores
+        batch_dice = 0
+        
+        # Calculate dice per sample in batch
+        for batch_idx in range(inputs.shape[0]):
+            sample_dice = 0
+            for class_idx in range(self.num_classes):
+                pred = inputs_soft[batch_idx, class_idx]
+                target = targets_one_hot[batch_idx, class_idx]
+                
+                intersection = (pred * target).sum()
+                cardinality = pred.sum() + target.sum()
+                
+                if cardinality > 0:
+                    sample_dice += (2. * intersection / (cardinality + 1e-5))
+                else:
+                    # Both prediction and target are empty for this class
+                    sample_dice += 1.0
+                    
+            batch_dice += sample_dice / self.num_classes
+        
+        # Average across batch
+        dice_coefficient = batch_dice / inputs.shape[0]
+        dice_loss = 1 - dice_coefficient
+        
+        # Combine both losses
+        return self.ce_weight * ce_loss + self.dice_weight * dice_loss
+
+# In your metrics.py or evaluation code:
+def calculate_per_class_metrics(predictions, targets, num_classes):
+    """Calculate metrics for each class separately"""
+    per_class_iou = []
+    per_class_dice = []
+    
+    for cls in range(num_classes):
+        # Create binary masks
+        pred_mask = (predictions == cls)
+        target_mask = (targets == cls)
+        
+        # Calculate IoU
+        intersection = (pred_mask & target_mask).sum()
+        union = (pred_mask | target_mask).sum()
+        iou = intersection / (union + 1e-6)
+        
+        # Calculate Dice
+        dice = 2 * intersection / (pred_mask.sum() + target_mask.sum() + 1e-6)
+        
+        per_class_iou.append(float(iou))
+        per_class_dice.append(float(dice))
+    
+    return {'per_class_iou': per_class_iou, 'per_class_dice': per_class_dice}
+
+def calculate_sqrt_inverse_weights(class_counts):
+    """Calculate sqrt-inverse frequency weights with proper normalization"""
+    # Convert class_counts to numpy array if it's not already
+    if isinstance(class_counts, dict):
+        # If class_counts is a dictionary
+        max_class = max(class_counts.keys()) + 1
+        counts_array = np.zeros(max_class, dtype=np.float32)
+        for cls, count in class_counts.items():
+            counts_array[cls] = count
+    else:
+        # If class_counts is already an array-like object
+        counts_array = np.array(class_counts, dtype=np.float32)
+    
+    # Calculate total pixels
+    total_pixels = np.sum(counts_array)
+    
+    # Calculate sqrt-inverse weights
+    num_classes = len(counts_array)
+    weights = np.zeros(num_classes, dtype=np.float32)
+    
+    for cls in range(num_classes):
+        # Add a small constant (1.0) to avoid division by zero
+        weights[cls] = np.sqrt(total_pixels / (num_classes * max(counts_array[cls], 1.0)))
+    
+    # Convert to tensor
+    weights_tensor = torch.tensor(weights, dtype=torch.float32)
+    
+    # Cap to avoid extreme values (limit to 3x the minimum non-zero weight)
+    non_zero_weights = weights_tensor[weights_tensor > 0]
+    if len(non_zero_weights) > 0:
+        min_non_zero = torch.min(non_zero_weights)
+        max_weight = min_non_zero * 10.0  # Allow up to 10x difference between weights
+        weights_tensor = torch.clamp(weights_tensor, max=max_weight)
+    
+    # Normalize to maintain scale (sum to number of classes)
+    weights_tensor = weights_tensor / weights_tensor.sum() * num_classes
+    
+    return weights_tensor

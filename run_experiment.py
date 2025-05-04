@@ -16,7 +16,7 @@ import torch
 """
 python run_experiment.py --data_dir "F:\processed_data\training_dataset_new" --save_dir "F:\processed_data\new_experiment_results" --encoder_type best_performance --num_classes 9 --use_normalizer --custom_experiment --experiment_config experiments_config.json --use_copy_paste  --use_amp
 
-python run_experiment.py --data_dir F:\processed_data\training_dataset --encoder_type best_performance --use_normalizer --batch_size 8 --num_epochs 20 --early_stopping 5 --save_dir F:\processed_data\model_experiments --wandb_project sentinel2_landcover --patch_size 768 --use_copy_paste --custom_experiment --experiment_config experiments_config.json
+python run_experiment.py --data_dir F:\processed_data\training_dataset_256 --encoder_type resnet18 --use_normalizer --batch_size 8 --num_epochs 20 --early_stopping 5 --save_dir F:\processed_data\model_experiments_special --wandb_project sentinel2_landcover --patch_size 256 --use_copy_paste --custom_experiment --experiment_config experiments_config.json --use_improved_sampler --use_copy_paste
 """
 
 if __name__ == "__main__":
@@ -78,6 +78,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Validate dataset for invalid class indices",
     )
+    
+    parser.add_argument(
+        "--use_improved_sampler",
+        action="store_true",
+        default=True,  # Making it true by default
+        help="Use improved rare class sampling with dynamic weighting (default: True)"
+    )
     #parser.add_argument(
     #    "--ignore_index",
     #    type=int,
@@ -131,7 +138,7 @@ if __name__ == "__main__":
         help="Directory containing the dataset patches",
     )
     parser.add_argument(
-        "--patch_size", type=int, default=512, help="Size of input patches"
+        "--patch_size", type=int, default=256, help="Size of input patches"
     )
     parser.add_argument(
         "--num_workers",

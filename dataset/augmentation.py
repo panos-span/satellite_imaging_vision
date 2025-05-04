@@ -50,7 +50,7 @@ class RGBTransformWrapper(DualTransform):
         return ("rgb_transform", "rgb_indices")
 
 
-def get_train_transform(p=0.5, patch_size=768, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
+def get_train_transform(p=0.5, patch_size=256, use_copy_paste=False, object_classes=None, rgb_indices=[0, 1, 2]):
     """
     Get a memory-efficient set of data augmentations for training.
     """
@@ -77,50 +77,36 @@ def get_train_transform(p=0.5, patch_size=768, use_copy_paste=False, object_clas
     
     # Memory-efficient geometric augmentations
     transforms_list = [
-        # Basic flips and rotations (memory efficient)
+        # Keep all flips and rotations - these are fast operations
         A.HorizontalFlip(p=p),
         A.VerticalFlip(p=p),
         A.RandomRotate90(p=p),
         
-        # Simple resizing instead of complex cropping/padding operations
-        A.Resize(height=patch_size, width=patch_size),
+        # REMOVE the resize operation entirely - patches already have correct size
+        # A.Resize(height=patch_size, width=patch_size),  # Remove this
         
-        # Limit memory-intensive transforms to lower probability
-        # Only include ElasticTransform OR GridDistortion, not both
-        A.OneOf([
-            A.ElasticTransform(p=1.0, alpha=60, sigma=60 * 0.05),  # Reduced complexity
-            A.GridDistortion(p=1.0, num_steps=5),  # Reduced grid complexity
-        ], p=0.2),  # Lower probability for these expensive operations
+        # REMOVE expensive elastic/grid transforms completely
+        # They're the biggest bottleneck in your pipeline
         
-        # Simpler affine transform with limited parameters
-        A.ShiftScaleRotate(p=0.3, scale_limit=0.1, rotate_limit=15),  # More efficient than full Affine
+        # Optimize ShiftScaleRotate to be more conservative
+        A.ShiftScaleRotate(p=0.2, scale_limit=0.05, rotate_limit=10),
         
-        # Basic radiometric augmentations (memory efficient)
+        # Keep basic contrast adjustments - relatively fast
         A.RandomBrightnessContrast(p=p),
-        
-        # Avoid memory-intensive GaussianBlur and use ChannelDropout with lower probability
-        A.ChannelDropout(p=0.05, channel_drop_range=(1, 1), fill=0),  # Reduced probability and range
-        
-        # RGB-specific transformations (using our wrapper)
-        RGBTransformWrapper(
-            rgb_transform=rgb_only_transforms,
-            rgb_indices=rgb_indices,
-            p=0.3  # Reduced probability
-        ),
     ]
     
     # Add CopyPaste augmentation if requested, but with reduced parameters
     if use_copy_paste and LandCoverCopyPaste is not None:
         # Define rare classes that need more augmentation
-        rare_classes = [5, 6, 8]  # Most rare classes
-        
+        rare_classes = [0, 2, 5, 6, 8]  # Most rare classes
+
+        # Modify LandCoverCopyPaste to use the cache
         transforms_list.append(
             LandCoverCopyPaste(
                 object_classes=rare_classes,
-                p=0.3,  # Reduced probability
-                max_objects_per_image=3,  # Reduced from 5
-                min_object_area=100,
-                blend_mode='normal'  # Simpler blending mode
+                p=0.2,
+                max_objects_per_image=2,
+                min_object_area=150,
             )
         )
     
@@ -136,7 +122,7 @@ def get_train_transform(p=0.5, patch_size=768, use_copy_paste=False, object_clas
     return transform
 
 
-def get_val_transform(patch_size=768):
+def get_val_transform(patch_size=256):
     """
     Get memory-efficient validation transforms.
     """

@@ -7,7 +7,7 @@
     "scheduler": "onecycle",
     "freeze_backbone": true,
     "progressive_unfreeze": false,
-    "weight_decay": 1e-4,
+    "weight_decay": 5e-4,
     "skip_connections": 4,
     "description": "Frozen backbone with OneCycle learning rate scheduler",
     "use_normalizer": true
@@ -20,7 +20,7 @@
     "scheduler": "cosine",
     "freeze_backbone": true,
     "progressive_unfreeze": false,
-    "weight_decay": 1e-4,
+    "weight_decay": 5e-4,
     "min_lr": 1e-6,
     "skip_connections": 4,
     "description": "Cosine annealing scheduler with partial backbone training",
@@ -34,7 +34,7 @@
     "scheduler": "onecycle",
     "freeze_backbone": true,
     "progressive_unfreeze": true,
-    "weight_decay": 1e-4,
+    "weight_decay": 5e-4,
     "skip_connections": 4,
     "description": "Progressive unfreezing starting from frozen backbone",
     "use_normalizer": true

@@ -18,7 +18,6 @@ import pickle
 """
 python prepare_dataset.py --image_path "F:\processed_data\processed_data\dataset\sentinel_image.tif" --mask_path "F:\processed_data\processed_data\dataset\ground_truth.tif" --validity_mask_path "F:\processed_data\processed_data\dataset\validity_mask.tif" --output_dir "F:\processed_data\training_dataset_new" --patch_size 512 --overlap 128 --val_split 0.15 --test_split 0.15 --force_include_zero --normalize_method pretrained --torchgeo_compatible --focus_rare_classes
 """
-
 # Import custom modules
 try:
     from dataset_splitter import create_patch_based_splits
@@ -391,7 +390,7 @@ def save_remapped_mask(mask_path, remapped_mask, output_path):
     with rasterio.open(output_path, "w", **profile) as dst:
         dst.write(remapped_mask, 1)
         
-def ensure_rare_class_representation(mask_path, rare_class_values, patch_size=512):
+def ensure_rare_class_representation(mask_path, rare_class_values, patch_size=128):
     """
     Explicitly identify patches containing rare classes to ensure they're included in the dataset.
     
@@ -577,11 +576,11 @@ def create_remapped_dataset(args):
         # Find remapped values for classes 50 and 90
         for orig_class_str, new_class in mapping_info["class_mapping"].items():
             orig_class = int(orig_class_str)
-            if orig_class in [50, 60, 80, 90]:  # The original very rare classes
+            if orig_class in [20, 50, 60, 90]:  # The original very rare classes
                 rare_classes.append(new_class)
     else:
         # If no remapping, use original class values
-        rare_classes = [50, 60, 80, 90]
+        rare_classes = [20, 50, 60, 90]
     
     # Find additional patches centered on rare classes
     mask_path_to_use = remapped_mask_path if need_remapping else args.mask_path

@@ -11,27 +11,34 @@ This script implements a complete training pipeline with:
 7. Automatic class detection from dataset
 """
 
+import argparse
 import json
 import os
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
-import argparse
-import numpy as np
 
 import wandb
 from dataset.augmentation import get_train_transform, get_val_transform
 from dataset.class_remapper import create_class_remapper
 from dataset.mask_handler import clean_mask, inspect_dataset_masks
-from dataset.metrics import create_metrics, BalancedFocalLoss, calculate_balanced_alpha
-from dataset.patch_dataset import create_patch_data_loaders
+from dataset.metrics import (
+    CombinedCEDiceLoss,
+    calculate_balanced_alpha,
+    calculate_sqrt_inverse_weights,
+    create_metrics,
+)
 from dataset.normalizers import load_sentinel2_normalizer, normalize_batch
+from dataset.patch_dataset import create_patch_data_loaders
 from dataset.utils import detect_classes_from_dataset
 from models.unet import UNet
+
+torch.backends.cudnn.benchmark = True
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -206,8 +213,8 @@ def train_epoch(
                 scaler.scale(loss).backward()
 
                 # Clip gradients to prevent explosion
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                #scaler.unscale_(optimizer)
+                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -218,7 +225,7 @@ def train_epoch(
                 loss.backward()
 
                 # Clip gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 optimizer.step()
 
@@ -592,6 +599,53 @@ def train_model(
 
 
 def run_hyperparameter_experiment(args, experiment_configs=None):
+    def calculate_class_pixel_counts(dataset, num_samples=500):
+        """
+        Calculate class distribution from dataset for loss weighting.
+        
+        Parameters:
+        -----------
+        dataset : torch.utils.data.Dataset
+            Dataset to analyze
+        num_samples : int
+            Number of samples to analyze for efficiency
+        
+        Returns:
+        --------
+        dict, int
+            Dictionary with class counts and total pixels analyzed
+        """
+        # Limit samples for efficiency
+        num_samples = min(num_samples, len(dataset))
+        indices = np.random.choice(len(dataset), num_samples, replace=False)
+        
+        # Initialize counts
+        class_counts = {}
+        total_pixels = 0
+        
+        # Process samples
+        for i in tqdm(indices, desc="Analyzing class distribution"):
+            _, mask = dataset[i]
+            
+            # Convert to numpy if needed
+            if isinstance(mask, torch.Tensor):
+                mask_np = mask.numpy()
+            else:
+                mask_np = mask
+            
+            # Count total valid pixels
+            total_pixels += mask_np.size
+            
+            # Count per class
+            unique_values, counts = np.unique(mask_np, return_counts=True)
+            for cls, count in zip(unique_values, counts):
+                cls_int = int(cls)
+                if cls_int not in class_counts:
+                    class_counts[cls_int] = 0
+                class_counts[cls_int] += int(count)
+        
+        return class_counts, total_pixels
+
     """Run multiple training experiments with different hyperparameters."""
     # Create experiment directory
     experiment_dir = os.path.join(args.save_dir, "experiments")
@@ -619,12 +673,15 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             print(f"Warning: Normalizer not found at {normalizer_path}")
             print("Will apply default normalization during training")
 
+    # In main() and run_hyperparameter_experiment()
     data_loaders = create_patch_data_loaders(
         patches_dir=args.data_dir,
         batch_size=args.batch_size,
         train_transform=train_transform,
         val_transform=val_transform,
         num_workers=args.num_workers,
+        use_rare_class_sampler=True,  # Always use a sampler
+        use_improved_sampler=args.use_improved_sampler,  # Choose which sampler to use
     )
 
     # Inspect dataset masks to detect issues - ADDED FROM MAIN
@@ -754,28 +811,31 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
             weight_decay=config.get("weight_decay", 1e-4),
             optimizer_type=config.get("optimizer", "adam"),
         )
+        
+        # Calculate class weights for loss function
+        print("Calculating class distribution for loss weighting...")
+        class_counts, total_pixels = calculate_class_pixel_counts(data_loaders["train"].dataset, num_samples=500)
+        print(f"Total pixels analyzed: {total_pixels}")
 
-        # Create loss function
-        #criterion = (
-        #    nn.CrossEntropyLoss() if args.num_classes > 1 else nn.BCEWithLogitsLoss()
-        #)
-        # 1) compute pixel-counts per class over up to 500 samples
-        class_counts = np.zeros(args.num_classes, dtype=np.int64)
-        for i in range(min(500, len(data_loaders["train"].dataset))):
-            _, mask = data_loaders["train"].dataset[i]
-            unique, counts = np.unique(mask.numpy(), return_counts=True)
-            for cls, cnt in zip(unique, counts):
-                if 0 <= cls < args.num_classes:
-                    class_counts[cls] += cnt
+        for cls, count in sorted(class_counts.items()):
+            print(f"  Class {cls}: {count:,} pixels ({count/total_pixels*100:.2f}%)")
 
-        alpha = calculate_balanced_alpha(class_counts)
-        print(f"Using focal-loss α: {alpha}")
+        # Calculate sqrt-inverse class weights
+        class_weights = calculate_sqrt_inverse_weights(class_counts)
+        class_weights = class_weights.to(device)
+        print(f"Class weights: {class_weights}")
 
-        criterion = BalancedFocalLoss(
-            alpha=torch.tensor(alpha, dtype=torch.float32, device=device),
-            gamma=2.0,
-            reduction="mean",
+        # Create the combined loss function with class weights
+        criterion = CombinedCEDiceLoss(
+            weights=class_weights,
+            num_classes=args.num_classes,
+            ce_weight=0.7,  # Adjust as needed
+            dice_weight=0.3  # Adjust as needed
         )
+        
+        print("Using combined CE+Dice loss with class weights")
+
+
 
         # Create scheduler
         scheduler = None
@@ -965,7 +1025,10 @@ def run_hyperparameter_experiment(args, experiment_configs=None):
 
 
 def main(args):
-    """Main training function."""
+    """Main training function with optimizations for faster training."""
+    # Enable cuDNN benchmark mode for faster convolutions
+    torch.backends.cudnn.benchmark = True
+    
     # Set random seed for reproducibility
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -973,58 +1036,119 @@ def main(args):
 
     print(f"Using device: {device}")
 
-    # Create data loaders
-    print("Loading data...")
+    # Optimize CPU thread settings for faster data loading
+    if args.num_workers == 0:
+        args.num_workers = min(8, os.cpu_count())
+        print(f"Setting num_workers to {args.num_workers} for better performance")
+
+    # Create simplified transforms - reduce expensive augmentations
+    print("Loading data with optimized transformations...")
     train_transform = get_train_transform(
-        p=0.5, patch_size=args.patch_size, use_copy_paste=args.use_copy_paste
+        p=0.5, 
+        patch_size=args.patch_size, 
+        use_copy_paste=args.use_copy_paste,
+        # Keep copy-paste but reduce probability of expensive transforms
+        # This will be applied in the get_train_transform function
     )
     val_transform = get_val_transform(patch_size=args.patch_size)
 
+    # Load normalizer
     normalizer = None
     if args.use_normalizer:
         normalizer_path = os.path.join(args.data_dir, "normalizer.pkl")
         if os.path.exists(normalizer_path):
             print(f"Loading Sentinel-2 normalizer from {normalizer_path}")
-            normalizer = load_sentinel2_normalizer(normalizer_path)
-            print(f"Loaded normalizer with method: {normalizer.method}")
+            try:
+                normalizer = load_sentinel2_normalizer(normalizer_path)
+                print(f"Loaded normalizer with method: {normalizer.method}")
+            except Exception as e:
+                print(f"Error loading normalizer: {e}")
+                print("Will apply default normalization during training")
         else:
             print(f"Warning: Normalizer not found at {normalizer_path}")
             print("Will apply default normalization during training")
 
+    # Create data loaders with optimized settings
     data_loaders = create_patch_data_loaders(
         patches_dir=args.data_dir,
         batch_size=args.batch_size,
         train_transform=train_transform,
         val_transform=val_transform,
         num_workers=args.num_workers,
+        use_rare_class_sampler=True,  # Keep the rare class sampler
+        use_improved_sampler=args.use_improved_sampler,
+        # Add optimized DataLoader settings
+        pin_memory=True,
+        persistent_workers=True
     )
 
     print(f"Training on {len(data_loaders['train'].dataset)} samples")
     print(f"Validating on {len(data_loaders['val'].dataset)} samples")
 
-    # Inspect dataset masks to detect issues
-    print("\nInspecting dataset for mask issues...")
+    # Reduce dataset inspection sample size for faster startup
+    print("\nInspecting dataset for mask issues (using reduced sample size)...")
     train_inspection = inspect_dataset_masks(
-        data_loaders["train"].dataset, num_samples=50
+        data_loaders['train'].dataset, 
+        num_samples=min(50, len(data_loaders['train'].dataset))
     )
 
-    # Initialize class remapper if sparse indices detected
+    # Use cached class remapper if available to speed up startup
     class_remapper = None
+    remapper_cache_path = os.path.join(args.data_dir, "remapper_cache.pkl")
+    
     if train_inspection.get("sparse_indices", False):
-        print("\nDetected sparse class indices. Creating class remapper...")
-        class_remapper = create_class_remapper(
-            data_loaders["train"].dataset, num_samples=100
-        )
+        print("\nDetected sparse class indices. Looking for cached remapper first...")
+        if os.path.exists(remapper_cache_path):
+            try:
+                with open(remapper_cache_path, 'rb') as f:
+                    class_remapper = pickle.load(f)
+                print("Loaded class remapper from cache")
+            except Exception:
+                print("Failed to load cached remapper, creating new one")
+                class_remapper = create_class_remapper(
+                    data_loaders["train"].dataset, num_samples=100
+                )
+                # Cache the remapper
+                with open(remapper_cache_path, 'wb') as f:
+                    pickle.dump(class_remapper, f)
+        else:
+            print("Creating class remapper and caching for future use...")
+            class_remapper = create_class_remapper(
+                data_loaders["train"].dataset, num_samples=100
+            )
+            # Cache the remapper
+            with open(remapper_cache_path, 'wb') as f:
+                pickle.dump(class_remapper, f)
 
         # Update number of classes based on remapped classes
         args.num_classes = class_remapper.num_classes
         print(f"Using {args.num_classes} classes after remapping")
-    # Detect classes if not specified
+    # Auto-detect classes if needed
     elif args.auto_detect_classes or args.num_classes is None:
         print("Auto-detecting classes from dataset...")
-        class_info = detect_classes_from_dataset(
-            data_loaders["train"].dataset, sample_size=100
-        )
+        # Check for cached class info
+        class_info_path = os.path.join(args.data_dir, "class_info_cache.json")
+        if os.path.exists(class_info_path):
+            try:
+                with open(class_info_path, 'r') as f:
+                    class_info = json.load(f)
+                print("Loaded class info from cache")
+            except Exception:
+                print("Failed to load cached class info, detecting classes...")
+                class_info = detect_classes_from_dataset(
+                    data_loaders["train"].dataset, sample_size=100
+                )
+                # Cache the class info
+                with open(class_info_path, 'w') as f:
+                    json.dump(class_info, f)
+        else:
+            class_info = detect_classes_from_dataset(
+                data_loaders["train"].dataset, sample_size=100
+            )
+            # Cache the class info
+            with open(class_info_path, 'w') as f:
+                json.dump(class_info, f)
+                
         detected_num_classes = class_info["num_classes"]
 
         # Check if auto-detected classes match with inspection results
@@ -1043,20 +1167,9 @@ def main(args):
 
         print(f"Auto-detected {args.num_classes} classes")
 
-        # Update wandb config with detected classes
-        if args.wandb_project and not args.run_experiment:
-            wandb.config.update(
-                {
-                    "num_classes": args.num_classes,
-                    "class_values": class_info["class_values"],
-                    "class_distribution": class_info["class_distribution"],
-                    "is_binary_segmentation": class_info["is_binary"],
-                }
-            )
-
-    # Initialize wandb
+    # Initialize wandb with reduced logging frequency to decrease overhead
     if args.wandb_project and not args.run_experiment:
-        print(f"Initializing Weights & Biases project: {args.wandb_project}")
+        print(f"Initializing Weights & Biases project with optimized settings: {args.wandb_project}")
         config = {
             "in_channels": args.in_channels,
             "num_classes": args.num_classes,
@@ -1082,17 +1195,26 @@ def main(args):
             )
             config["num_original_classes"] = len(class_remapper.class_mapping)
 
-        wandb.init(project=args.wandb_project, config=config)
+        # Initialize with optimized settings
+        os.environ["WANDB_CONSOLE"] = "off"  # Reduce console output
+        wandb.init(
+            project=args.wandb_project, 
+            config=config,
+            # Lower log frequency to reduce overhead
+            settings=wandb.Settings(log_internal=60)  # Log internals every 60 seconds
+        )
 
     # Log dataset info to wandb
     if args.wandb_project and wandb.run is not None:
         wandb.run.summary["train_samples"] = len(data_loaders["train"].dataset)
         wandb.run.summary["val_samples"] = len(data_loaders["val"].dataset)
-        wandb.run.summary["mask_inspection"] = train_inspection
+        # Only log essential inspection info
+        wandb.run.summary["sparse_indices"] = train_inspection.get("sparse_indices", False)
+        wandb.run.summary["num_classes"] = args.num_classes
 
-    # Run hyperparameter experiment if requested
+    # Run hyperparameter experiment if requested - with optimized settings
     if args.run_experiment:
-        print("Running hyperparameter experiment...")
+        print("Running hyperparameter experiment with optimized settings...")
         best_config = run_hyperparameter_experiment(args)
 
         # Set best hyperparameters for final training
@@ -1107,7 +1229,7 @@ def main(args):
 
         print(f"Using best hyperparameters for final training: {best_config}")
 
-    # Create model
+    # Create model - use efficient variant if specified
     print(f"Creating U-Net model with {args.num_classes} output classes...")
     model = UNet(
         in_channels=args.in_channels,
@@ -1117,6 +1239,72 @@ def main(args):
         skip_connections=args.skip_connections,
         freeze_backbone=getattr(args, "freeze_backbone", True),
     ).to(device)
+    
+    # If PyTorch 2.0+ is available, use torch.compile for faster training
+    if hasattr(torch, "compile") and torch.__version__ >= "2.0.0":
+        try:
+            print("Using torch.compile for faster training...")
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"Could not use torch.compile: {e}")
+
+    # Precompute class weights for faster startup
+    # Calculate class weights for loss function
+    class_counts = np.zeros(args.num_classes, dtype=np.int64)
+    sample_size = min(500, len(data_loaders["train"].dataset))
+    
+    # Try to load cached class weights
+    class_weights_cache = os.path.join(args.data_dir, "class_weights_cache.pt")
+    if os.path.exists(class_weights_cache):
+        try:
+            class_weights = torch.load(class_weights_cache)
+            print("Loaded cached class weights")
+        except Exception:
+            print("Computing class weights...")
+            # Calculate class weights from dataset samples
+            for i in range(sample_size):
+                _, mask = data_loaders["train"].dataset[i]
+                unique, counts = np.unique(mask.numpy(), return_counts=True)
+                for cls, cnt in zip(unique, counts):
+                    if 0 <= cls < args.num_classes:
+                        class_counts[cls] += cnt
+            
+            # Apply square root inverse frequency weighting
+            class_weights = calculate_sqrt_inverse_weights(
+                {i: int(count) for i, count in enumerate(class_counts)},
+                total_pixels=class_counts.sum()
+            )
+            # Cache weights
+            torch.save(class_weights, class_weights_cache)
+    else:
+        print("Computing class weights...")
+        # Calculate class weights from dataset samples
+        for i in range(sample_size):
+            _, mask = data_loaders["train"].dataset[i]
+            unique, counts = np.unique(mask.numpy(), return_counts=True)
+            for cls, cnt in zip(unique, counts):
+                if 0 <= cls < args.num_classes:
+                    class_counts[cls] += cnt
+        
+        # Apply square root inverse frequency weighting
+        class_weights = calculate_sqrt_inverse_weights(
+            {i: int(count) for i, count in enumerate(class_counts)},
+            total_pixels=class_counts.sum()
+        )
+        # Cache weights
+        torch.save(class_weights, class_weights_cache)
+    
+    class_weights = class_weights.to(device)
+    print(f"Class weights: {class_weights}")
+
+    # Create loss function with balanced CE and Dice components
+    criterion = CombinedCEDiceLoss(
+        weights=class_weights,
+        num_classes=args.num_classes,
+        ce_weight=0.5,  # Balanced CE and Dice weights
+        dice_weight=0.5  # Balanced CE and Dice weights
+    )
+    print("Using combined CE+Dice loss with class weights")
 
     # Create optimizer with differential learning rates
     optimizer = create_optimizer_with_differential_lr(
@@ -1127,55 +1315,7 @@ def main(args):
         optimizer_type=args.optimizer,
     )
 
-    # Create loss function with ignore_index for invalid labels
-    if args.num_classes > 1:
-        # Calculate class weights based on inverse frequency
-        #class_counts = {i: 0 for i in range(args.num_classes)}
-#
-        ## Sample the dataset to get class distribution
-        #for i in range(min(500, len(data_loaders["train"].dataset))):
-        #    _, mask = data_loaders["train"].dataset[i]
-        #    unique, counts = np.unique(mask.numpy(), return_counts=True)
-        #    for cls, count in zip(unique, counts):
-        #        if 0 <= cls < args.num_classes:
-        #            class_counts[cls] += count
-#
-        ## Create weight tensor with inverse frequency weighting
-        #total_pixels = sum(class_counts.values())
-        #class_weights = torch.tensor(
-        #    [
-        #        total_pixels / (args.num_classes * max(count, 1))
-        #        for cls, count in class_counts.items()
-        #    ],
-        #    dtype=torch.float32,
-        #).to(device)
-        
-        #print(f"Class counts: {class_counts}")
-        #print(f"Using class weights: {class_weights}")
-
-        # Use weighted CrossEntropyLoss
-        #criterion = nn.CrossEntropyLoss(weight=class_weights)
-        
-        # 1) compute pixel-counts per class over up to 500 samples
-        class_counts = np.zeros(args.num_classes, dtype=np.int64)
-        for i in range(min(500, len(data_loaders["train"].dataset))):
-            _, mask = data_loaders["train"].dataset[i]
-            unique, counts = np.unique(mask.numpy(), return_counts=True)
-            for cls, cnt in zip(unique, counts):
-                if 0 <= cls < args.num_classes:
-                    class_counts[cls] += cnt
-        
-        alpha = calculate_balanced_alpha(class_counts)
-        print(f"Using focal-loss α: {alpha}")
-        criterion = BalancedFocalLoss(
-            alpha=torch.tensor(alpha, dtype=torch.float32, device=device),
-            gamma=2.0,
-            reduction="mean",
-        )
-    else:
-        criterion = nn.BCEWithLogitsLoss()
-
-    # Create scheduler
+    # Create scheduler - use OneCycleLR by default for faster convergence
     scheduler = None
     if args.scheduler == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1189,7 +1329,8 @@ def main(args):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=args.factor, patience=args.patience
         )
-    elif args.scheduler == "onecycle":
+    elif args.scheduler == "onecycle" or args.scheduler is None:
+        # Default to OneCycleLR for faster convergence
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=[
@@ -1217,8 +1358,8 @@ def main(args):
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Train model
-    print("Starting training...")
+    # Train model with optimized settings
+    print("Starting training with optimized settings...")
     history, best_epoch = train_model(
         model,
         data_loaders["train"],
@@ -1387,6 +1528,13 @@ if __name__ == "__main__":
     # Wandb parameters
     parser.add_argument(
         "--wandb_project", type=str, default=None, help="Weights & Biases project name"
+    )
+    
+    parser.add_argument(
+        "--use_improved_sampler",
+        action="store_true",
+        default=True,  # Making it true by default
+        help="Use improved rare class sampling with dynamic weighting (default: True)"
     )
 
     # Other parameters
