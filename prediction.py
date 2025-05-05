@@ -1255,6 +1255,30 @@ def main():
         args.class_mapping_file
     )
     
+    # Make sure inverse_mapping is loaded
+    if inverse_mapping is None:
+        print("ERROR: No inverse mapping found! Please provide a valid inverse mapping file.")
+        print("Checking for inverse_class_mapping.json in the current directory...")
+        if os.path.exists("inverse_class_mapping.json"):
+            try:
+                with open("inverse_class_mapping.json", "r") as f:
+                    inverse_mapping = json.load(f)
+                print("Successfully loaded inverse_class_mapping.json from current directory.")
+            except Exception as e:
+                print(f"Error loading inverse_class_mapping.json: {e}")
+                print("Exiting...")
+                return
+        else:
+            print("inverse_class_mapping.json not found in current directory.")
+            print("Please provide a valid inverse mapping file using --class_mapping_file")
+            print("Exiting...")
+            return
+    
+    # Print loaded inverse mapping for verification
+    print("\nLoaded inverse mapping:")
+    for model_idx, gt_class in sorted([(int(k), int(v)) for k, v in inverse_mapping.items()]):
+        print(f"  Model index {model_idx} -> Ground truth class {gt_class}")
+    
     # Step 4: Read ground truth first
     print("\nStep 4: Reading ground truth...")
     with rasterio.open(args.ground_truth) as src:
@@ -1273,12 +1297,17 @@ def main():
         normalizer=normalizer
     )
 
-    # Step 6: Create refined mapping
-    refined_mapping = create_refined_mapping(
-        co_occurrence,
-        gt_unique,
-        num_classes=model.final_conv.out_channels
-    )
+    # Step 6: SKIP refined mapping creation and FORCE using the inverse mapping
+    print("\nStep 6: Using loaded inverse mapping (skipping co-occurrence mapping)")
+    
+    # Convert inverse_mapping to the format expected by post_process_prediction
+    # The key difference: using the loaded inverse_mapping directly
+    refined_mapping = {int(k): int(v) for k, v in inverse_mapping.items()}
+    
+    # Print the mapping that will be used
+    print("\nUsing the following mapping:")
+    for model_idx, gt_class in sorted(refined_mapping.items()):
+        print(f"  Model index {model_idx} -> Ground truth class {gt_class}")
 
     # Step 7: Apply post-processing if requested
     if args.post_process:
@@ -1291,23 +1320,13 @@ def main():
         )
     else:
         print("\nStep 7: Applying basic remapping without spatial post-processing...")
-        if refined_mapping:
-            print(f"Using refined mapping with {len(refined_mapping)} classes")
-            final_prediction = remap_prediction(prediction_map, refined_mapping)
-        else:
-            print("Using original inverse mapping")
-            if inverse_mapping:
-                final_prediction = remap_prediction(prediction_map, inverse_mapping)
-            else:
-                final_prediction = prediction_map
-    
+        print(f"Using provided inverse mapping with {len(refined_mapping)} classes")
+        final_prediction = remap_prediction(prediction_map, refined_mapping)
+
     # Step 8: Save prediction
     print("\nStep 8: Saving prediction results...")
     prediction_path = os.path.join(args.output_dir, "prediction.tif")
     save_prediction(final_prediction, profile, prediction_path)
-    
-    # The rest of your code remains the same...
-    # [Keep your existing code for metrics calculation and visualization]
     
     # Step 7: Calculate metrics and visualize
     print("\nStep 7: Evaluating and visualizing results...")
